@@ -1,0 +1,407 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Gusgu H7 - unbranded Rockchip RK3326 handheld.
+ *
+ * Derived from the eeclone base, which is the only RK3326 tree here defining
+ * every node this device needs to override, and whose serial2 = &uart5 alias
+ * puts the H7's UART5 debug port on ttyS2 so the stock console= works.
+ *
+ * Everything below was taken from the device's own stock vendor DTB
+ * (rk3326-evb-lp3-v12-linux.dtb): the panel via generic-dsi's stock-DTB
+ * importer, the GPIO pin assignments verified against physical button presses.
+ */
+
+/dts-v1/;
+#include "rk3326-gameconsole-eeclone.dts"
+
+/ {
+	model = "Gusgu H7";
+	compatible = "gusgu,h7", "rockchip,rk3326";
+
+	/* Real GPIO volume buttons. Kept off the joypad so the OS treats them as
+	 * system keys - and so the initramfs recovery check still finds
+	 * KEY_VOLUMEDOWN on a real button rather than a floating ADC line. */
+	volume-keys {
+		compatible = "gpio-keys";
+		autorepeat;
+
+		vol-up {
+			gpios = <&gpio3 RK_PB0 GPIO_ACTIVE_LOW>;
+			label = "VOLUMEUP";
+			linux,code = <KEY_VOLUMEUP>;
+		};
+
+		vol-down {
+			gpios = <&gpio3 RK_PB1 GPIO_ACTIVE_LOW>;
+			label = "VOLUMEDOWN";
+			linux,code = <KEY_VOLUMEDOWN>;
+		};
+	};
+};
+
+/* 1024x768 Sitronix ST7703 (eeclone ships a 720x720 HX8394). */
+&internal_display {
+	panel_description =
+		"G size=153,85 delays=20,20,20,120,20 format=rgb888 lanes=4 flags=0xe03",
+
+		"M clock=62000 horizontal=1024,90,80,80 vertical=768,16,8,8 default=1",
+		"M clock=62050 horizontal=1024,90,115,80 vertical=768,16,157,8",
+		"M clock=62010 horizontal=1024,90,131,80 vertical=768,16,144,8",
+		"M clock=63620 horizontal=1024,90,123,80 vertical=768,16,174,8",
+		"M clock=62560 horizontal=1024,90,86,80 vertical=768,16,58,8",
+		"M clock=68280 horizontal=1024,90,114,80 vertical=768,16,82,8",
+		"M clock=63000 horizontal=1024,90,80,80 vertical=768,16,33,8",
+		"M clock=62160 horizontal=1024,90,101,80 vertical=768,16,8,8",
+		"M clock=75890 horizontal=1024,90,120,80 vertical=768,16,169,8",
+		"M clock=90540 horizontal=1024,90,120,80 vertical=768,16,121,8",
+		"M clock=91800 horizontal=1024,90,81,80 vertical=768,16,8,8",
+		"M clock=122400 horizontal=1024,90,81,80 vertical=768,16,8,8",
+
+		"I seq=ee01",
+		"I seq=ea07",
+		"I seq=eb12",
+		"I seq=0a5e",
+		"I seq=1314",
+		"I seq=1735",
+		"I seq=1d33",
+		"I seq=2101",
+		"I seq=2828",
+		"I seq=2918",
+		"I seq=2a63",
+		"I seq=2ff3",
+		"I seq=ee02",
+		"I seq=39a9",
+		"I seq=0000",
+		"I seq=010d",
+		"I seq=0212",
+		"I seq=0308",
+		"I seq=040e",
+		"I seq=0530",
+		"I seq=060b",
+		"I seq=070e",
+		"I seq=080f",
+		"I seq=090e",
+		"I seq=0a11",
+		"I seq=0b4e",
+		"I seq=0c14",
+		"I seq=0d1a",
+		"I seq=0e2f",
+		"I seq=0f36",
+		"I seq=103f",
+		"I seq=2000",
+		"I seq=210d",
+		"I seq=2212",
+		"I seq=2308",
+		"I seq=240e",
+		"I seq=2530",
+		"I seq=260b",
+		"I seq=270e",
+		"I seq=280f",
+		"I seq=290e",
+		"I seq=2a11",
+		"I seq=2b4e",
+		"I seq=2c14",
+		"I seq=2d1a",
+		"I seq=2e2f",
+		"I seq=2f36",
+		"I seq=303f",
+		"I seq=ee04",
+		"I seq=0005",
+		"I seq=0101",
+		"I seq=0280",
+		"I seq=0304",
+		"I seq=0400",
+		"I seq=0606",
+		"I seq=0705",
+		"I seq=081a",
+		"I seq=0920",
+		"I seq=0a0e",
+		"I seq=0b00",
+		"I seq=2040",
+		"I seq=2408",
+		"I seq=ee05",
+		"I seq=0001",
+		"I seq=0109",
+		"I seq=0205",
+		"I seq=0305",
+		"I seq=0705",
+		"I seq=080d",
+		"I seq=0900",
+		"I seq=0a12",
+		"I seq=0b14",
+		"I seq=0c66",
+		"I seq=1003",
+		"I seq=1107",
+		"I seq=1205",
+		"I seq=1305",
+		"I seq=1912",
+		"I seq=1af6",
+		"I seq=4055",
+		"I seq=4100",
+		"I seq=4303",
+		"I seq=4401",
+		"I seq=4581",
+		"I seq=4606",
+		"I seq=4700",
+		"I seq=ee06",
+		"I seq=0045",
+		"I seq=0201",
+		"I seq=0488",
+		"I seq=06cd",
+		"I seq=08ef",
+		"I seq=09cd",
+		"I seq=0aab",
+		"I seq=0b89",
+		"I seq=0c67",
+		"I seq=0d45",
+		"I seq=0e23",
+		"I seq=0f01",
+		"I seq=ee07",
+		"I seq=003c",
+		"I seq=013c",
+		"I seq=023c",
+		"I seq=033c",
+		"I seq=040d",
+		"I seq=053c",
+		"I seq=063c",
+		"I seq=073c",
+		"I seq=0808",
+		"I seq=0910",
+		"I seq=0a12",
+		"I seq=0b14",
+		"I seq=0c16",
+		"I seq=0d18",
+		"I seq=0e1a",
+		"I seq=0f1c",
+		"I seq=101e",
+		"I seq=1104",
+		"I seq=1200",
+		"I seq=133c",
+		"I seq=140c",
+		"I seq=153c",
+		"I seq=203c",
+		"I seq=213c",
+		"I seq=223c",
+		"I seq=233c",
+		"I seq=240d",
+		"I seq=253c",
+		"I seq=263c",
+		"I seq=273c",
+		"I seq=2808",
+		"I seq=2911",
+		"I seq=2a13",
+		"I seq=2b15",
+		"I seq=2c17",
+		"I seq=2d19",
+		"I seq=2e1b",
+		"I seq=2f1d",
+		"I seq=301f",
+		"I seq=3105",
+		"I seq=3201",
+		"I seq=333c",
+		"I seq=340c",
+		"I seq=353c",
+		"I seq=ee08",
+		"I seq=1000",
+		"I seq=12dc",
+		"I seq=131c",
+		"I seq=1723",
+		"I seq=1820",
+		"I seq=2080",
+		"I seq=ee0f",
+		"I seq=0001",
+		"I seq=0100",
+		"I seq=ee00",
+		"I seq=ea00",
+		"I seq=eb00",
+		"I seq=3600",
+		"I seq=11 wait=200",
+		"I seq=29 wait=20";
+};
+
+/* eeclone samples SARADC ch2 for volume; on the H7 that line is the right
+ * stick X axis. A centred stick reads as KEY_VOLUMEDOWN held, which sends
+ * ROCKNIX init into USB-MSC recovery on every boot. */
+&adc_keys {
+	status = "disabled";
+};
+
+/* No analog mux on this hardware - both sticks wire straight to SARADC 0-3.
+ * amux-count = 0 until a driver that reads four direct channels exists. */
+/* The H7 has ONE stick on SARADC ch1 (X) and ch2 (Y), wired direct - no analog
+ * mux. rocknix-singleadc-joypad can only read a single muxed channel
+ * (devm_iio_channel_get "amux_adc"), so switch to rocknix-joypad, which takes
+ * "joy_x"/"joy_y" directly. Both drivers emit the same button set, and the
+ * driver reads linux,code per child, so the sw<N> nodes below carry over.
+ *
+ * Measured raw values: X left=92 centre=460 right=873, Y up=155 centre=536
+ * down=921 - both rise in the ABS_X/ABS_Y positive direction, so NO inversion.
+ * Note invert-absx/absy are device_property_present() checks: setting them to
+ * <0> still inverts. They must be absent.
+ */
+&joypad {
+	compatible = "rocknix-joypad";
+	/* The driver maps ADC channels positionally, and defaults to
+	 * right-stick-first {"rx","ry","x","y"}. With only two channels the
+	 * single stick would land on ABS_RX/ABS_RY. abs-left-first selects
+	 * {"x","y","rx","ry"} so it reports as the left stick. */
+	abs-left-first;
+	io-channel-names = "joy_x", "joy_y";
+	io-channels = <&saradc 1>, <&saradc 2>;
+	button-adc-count = <2>;
+	button-adc-scale = <1>;
+	button-adc-deadzone = <20>;
+	button-adc-fuzz = <32>;
+	button-adc-flat = <32>;
+	/delete-property/ amux-count;
+	/delete-property/ amux-channel-mapping;
+	/delete-property/ amux-en-gpios;
+	/delete-property/ amux-a-gpios;
+	/delete-property/ amux-b-gpios;
+	/delete-property/ invert-absx;
+	/delete-property/ invert-absy;
+
+	/delete-node/ sw1;
+	/delete-node/ sw2;
+	/delete-node/ sw3;
+	/delete-node/ sw4;
+	/delete-node/ sw5;
+	/delete-node/ sw6;
+	/delete-node/ sw7;
+	/delete-node/ sw8;
+	/delete-node/ sw11;
+	/delete-node/ sw12;
+	/delete-node/ sw13;
+	/delete-node/ sw15;
+	/delete-node/ sw16;
+	/delete-node/ sw19;
+	/delete-node/ sw20;
+	/delete-node/ sw21;
+	/delete-node/ sw22;
+
+	sw1 {
+		gpios = <&gpio3 RK_PB3 GPIO_ACTIVE_LOW>;
+		label = "GPIO TOP-RIGHT";
+		linux,code = <BTN_TR>;
+	};
+
+	sw2 {
+		gpios = <&gpio3 RK_PA0 GPIO_ACTIVE_LOW>;
+		label = "GPIO TOP-RIGHT2";
+		linux,code = <BTN_TR2>;
+	};
+
+	sw3 {
+		gpios = <&gpio3 RK_PB5 GPIO_ACTIVE_LOW>;
+		label = "GPIO TOP-LEFT";
+		linux,code = <BTN_TL>;
+	};
+
+	sw4 {
+		gpios = <&gpio3 RK_PA6 GPIO_ACTIVE_LOW>;
+		label = "GPIO TOP-LEFT2";
+		linux,code = <BTN_TL2>;
+	};
+
+	sw5 {
+		gpios = <&gpio3 RK_PC0 GPIO_ACTIVE_LOW>;
+		label = "GPIO BTN-A";
+		linux,code = <BTN_EAST>;
+	};
+
+	sw6 {
+		gpios = <&gpio3 RK_PC1 GPIO_ACTIVE_LOW>;
+		label = "GPIO BTN-B";
+		linux,code = <BTN_SOUTH>;
+	};
+
+	sw7 {
+		gpios = <&gpio3 RK_PC2 GPIO_ACTIVE_LOW>;
+		label = "GPIO BTN-X";
+		linux,code = <BTN_NORTH>;
+	};
+
+	sw8 {
+		gpios = <&gpio3 RK_PC3 GPIO_ACTIVE_LOW>;
+		label = "GPIO BTN-Y";
+		linux,code = <BTN_WEST>;
+	};
+
+	sw9 {
+		gpios = <&gpio3 RK_PC4 GPIO_ACTIVE_LOW>;
+		label = "GPIO DPAD-LEFT";
+		linux,code = <BTN_DPAD_LEFT>;
+	};
+
+	sw10 {
+		gpios = <&gpio3 RK_PC5 GPIO_ACTIVE_LOW>;
+		label = "GPIO DPAD-RIGHT";
+		linux,code = <BTN_DPAD_RIGHT>;
+	};
+
+	sw11 {
+		gpios = <&gpio3 RK_PC6 GPIO_ACTIVE_LOW>;
+		label = "GPIO DPAD-UP";
+		linux,code = <BTN_DPAD_UP>;
+	};
+
+	sw12 {
+		gpios = <&gpio3 RK_PC7 GPIO_ACTIVE_LOW>;
+		label = "GPIO DPAD-DOWN";
+		linux,code = <BTN_DPAD_DOWN>;
+	};
+
+	sw13 {
+		gpios = <&gpio3 RK_PD0 GPIO_ACTIVE_LOW>;
+		label = "GPIO SELECT";
+		linux,code = <BTN_SELECT>;
+	};
+
+	sw14 {
+		gpios = <&gpio3 RK_PD1 GPIO_ACTIVE_LOW>;
+		label = "GPIO START";
+		linux,code = <BTN_START>;
+	};
+
+	sw15 {
+		gpios = <&gpio3 RK_PD2 GPIO_ACTIVE_LOW>;
+		label = "GPIO FN";
+		linux,code = <BTN_MODE>;
+	};
+
+	sw17 {
+		gpios = <&gpio2 RK_PB5 GPIO_ACTIVE_LOW>;
+		label = "GPIO THUMBL";
+		linux,code = <BTN_THUMBL>;
+	};
+
+	sw18 {
+		gpios = <&gpio2 RK_PB6 GPIO_ACTIVE_LOW>;
+		label = "GPIO THUMBR";
+		linux,code = <BTN_THUMBR>;
+	};
+};
+
+/* Pull-ups for the H7's own button lines. */
+&btn_pins {
+	rockchip,pins =
+		<2 RK_PB5 RK_FUNC_GPIO &pcfg_pull_up>,
+		<2 RK_PB6 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PA0 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PA6 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PB0 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PB1 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PB3 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PB5 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PC0 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PC1 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PC2 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PC3 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PC4 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PC5 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PC6 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PC7 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PD0 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PD1 RK_FUNC_GPIO &pcfg_pull_up>,
+		<3 RK_PD2 RK_FUNC_GPIO &pcfg_pull_up>;
+};

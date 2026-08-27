@@ -7,7 +7,7 @@ PKG_NAME="libmali"
 PKG_LICENSE="nonfree"
 PKG_SITE="https://github.com/ROCKNIX/libmali"
 PKG_VERSION="0fe30426b822699f0a660268a6040fdafce229d1"
-PKG_SHA256="b2d0b4904577aa1cf737f1402052a6651f84fcbc94aca0601b782ff63cc9167b"
+PKG_SHA256="54b8af924f582f7da7e120fbad4812a502cc7cc67f6d6ab061377cb403f3eb2d"
 # zip format makes extract very fast (<1s). tgz takes 20 seconds to scan the whole file
 PKG_URL="${PKG_SITE}/archive/${PKG_VERSION}.zip"
 PKG_DEPENDS_TARGET="toolchain libdrm patchelf:host gpudriver SDL2_glesonly"
