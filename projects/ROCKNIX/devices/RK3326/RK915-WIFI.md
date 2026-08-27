@@ -5,179 +5,119 @@ branch `gusgu-h7-port`, kernel 7.1.2, serial console `/dev/ttyUSB0` @ 1500000 8N
 
 ## Summary
 
-The WiFi driver comes up, associates and gets a DHCP lease, then the link dies a
-few seconds later. The trigger is a race that the driver loses **while the system
-is still booting** — roughly two boots in three. Once the system has settled,
-the driver is stable: reloading it after boot produced 300/300 and 396/400 pings
-with zero faults.
+The RK915 firmware faults under load — bulk traffic trips it within seconds, and
+the driver also loses the same race against boot-time system load. The driver
+detects the fault and asks mac80211 to restart the hardware, but **recovery could
+never complete**, so every fault killed the link until the module was reloaded by
+hand.
 
-The shipped fix is therefore a recovery unit, not a driver patch: 30 s after boot,
-**if the driver logged a fault**, reload `rk915` and restart `iwd`. Validated over
-three consecutive boots — all three ended with working networking, two of them
-after the unit logged `recovered`, and a later boot confirmed it correctly does
-nothing when the driver came up clean.
+The root cause was an `sdio_reset` latch: after the first io error, every SDIO
+accessor returned success *without doing any i/o*, so the firmware re-download
+that recovery depends on wrote into nothing. It was only ever cleared by
+`sdio_probe()` — which is precisely why a module reload was the one thing that
+worked. Fixed, along with two further bugs it was masking (vif accounting not
+reset across a hardware restart, and a racy fw-error claim).
 
-A driver-level patch was written, built and tested, and is documented below as a
-**disproven hypothesis**. It is not shipped.
+**The driver now recovers in place**: same interface, same DHCP lease, no module
+reload. Measured against a reproducer that kills the link in ~10 s: 23 recoveries,
+31 successful firmware downloads, 0 failures.
 
-⚠️ **There is a serious remaining limitation: a sustained transmit workload
-hard-freezes the device and needs a power cycle.** See the next section before
-relying on WiFi for anything more than light traffic.
+The underlying fault still occurs; it is simply no longer fatal. A boot-time
+watchdog remains as a backstop but should now essentially never fire.
 
-## Known limitation: sustained TX freezes the device
+Earlier sections below record hypotheses that were tested on hardware and
+**disproven** — a `udelay` in the chained-RX path, and a `debug_mask` bisect that
+did not replicate. They are kept because they document what the fault is *not*.
 
-**Do not use WiFi for large uploads on this device.** A sustained transmit
-workload — uploading a file through the built-in web server is the reproducer —
-locks the handheld up hard. It cannot be recovered from software; it needs a
-power cycle.
+## Root cause: the sdio_reset latch
 
-### Symptom
+**Fixed.** `patches/rk915-0003-clear-sdio-reset-latch-on-power-cycle.patch`.
 
-```
-rockchip-vop ff460000.vop: [drm:vop_crtc_atomic_flush] *ERROR* VOP vblank IRQ stuck for 10 ms
-[CRTC:39:crtc-0] vblank wait timed out
-WARNING: drivers/gpu/drm/drm_atomic_helper.c:1921 at drm_atomic_helper_wait_for_vblanks...
-rcu: INFO: rcu_sched self-detected stall on CPU
-rcu:     0-....: (6303 ticks this GP) ...
-CPU: 0 UID: 0 PID: 502 Comm: rk915_tx
+`_sdio_reset()` latches a file-static flag on the first io error:
+
+```c
+static bool sdio_reset;
+int _sdio_reset(struct host_io_info *host) { sdio_reset = true; return 0; }
 ```
 
-The display warning is the loudest part of the log and it is **a symptom, not the
-cause**. The stalled task is `rk915_tx`, and the display is simply being starved.
+and every sdio accessor then short-circuits, **returning success without doing
+any i/o**:
 
-### Mechanism
-
-The stalled thread sits here, unchanged across two RCU reports 63 s apart:
-
-```
-dw_mci_start_command+0x58/0x120
-dw_mci_start_request / dw_mci_request / __mmc_start_request
-mmc_wait_for_req / mmc_io_rw_extended / sdio_io_rw_ext_helper
-sdio_memcpy_toio
-sdio_send_data [rk915] / rk915_data_write [rk915]
-rpu_send_cmd_datas [rk915] / tx_thread [rk915]
+```c
+static int sdio_send_data(struct host_io_info *host, u32 addr, u8 *buf, u32 len)
+{
+        if (sdio_reset == true)
+                return 0;
+        return sdio_memcpy_toio(func, addr, buf, len);
+}
 ```
 
-Two facts explain the freeze:
+`rk915_io_reset()` calls it from six sites in `hal_io.c`, so *any* io error arms
+it, and nothing cleared it except `sdio_probe()` — a module (re)load.
 
-1. **The chip has fallen off the SDIO bus.** The register dump carries
-   `x19: 00000000ffffffff` — the dw_mmc status register reading all-ones, which
-   is what a dead or unclocked bus returns. `SDMMC_STATUS_BUSY` can therefore
-   never clear.
+So firmware error recovery could never work. Recovery power-cycles the chip and
+re-downloads the firmware, but every write is a silent no-op reporting success.
+Per-block timing makes it unambiguous:
 
-2. **The busy-wait is atomic.** `dw_mci_wait_while_busy()` polls for up to
-   **500 ms without sleeping**, on every data command:
+| | block 0 | block 1 | total |
+|---|---|---|---|
+| failing download | `ret=0` in **2 µs** | `ret=0` in **5 µs** | 1649 µs |
+| working download | `ret=0` in 269 µs | `ret=0` in 247 µs | 4611 µs |
 
-   ```c
-   if ((cmd_flags & SDMMC_CMD_PRV_DAT_WAIT) && !(cmd_flags & SDMMC_CMD_VOLT_SWITCH)) {
-           if (readl_poll_timeout_atomic(host->regs + SDMMC_STATUS, status,
-                                         !(status & SDMMC_STATUS_BUSY),
-                                         10, 500 * USEC_PER_MSEC))
-                   dev_err(host->dev, "Busy; trying anyway\n");
-   }
-   ```
+4096 bytes in 2 µs is 2 GB/s — the bus cannot do that. Nothing was transferred,
+so the readback was all zeroes (`30550/48056 bytes differ, first at 0x0`), the
+chip never reached `WAIT_PATCH`, and mac80211 shut every interface down.
 
-So once the chip dies, `rk915_tx` burns half a second of un-preemptible CPU per
-command and keeps submitting them. A CPU is pinned indefinitely — the stall
-counter went from 6303 to 25202 ticks (~250 s) across two reports. RCU stalls,
-the VOP's vblank IRQ misses its deadline, and DRM's commit worker times out
-waiting for it. **Nothing anywhere in the path ever concludes "the card is gone,
-stop trying".**
+This also explains the one thing that always worked: reloading the module runs
+`sdio_probe()`, which clears the latch.
 
-### The failure chain
+The fix drops the latch in `rk915_sdio_power_cycle()`, once the card has been
+reset, re-enabled and had its block size restored — the point at which i/o is
+valid again.
 
-Traced with the driver's own logging (safe once `console_loglevel` is 1, which
-keeps printk in the ring buffer and off the 1.5 Mbaud console):
+### Two further bugs found on the way
 
-```
-rk915: rk915_serias_read: length(61680) too long error.   ← the 0xF0F0 header bug
-rk915: fw error (0): requesting mac80211 restart          ← driver DOES detect it
-ieee80211 phy4: Hardware restart was requested
-mmc_host mmc2: Bus speed = 400000Hz  →  50000000Hz        ← card really is power-cycled
-rk915: rk915_download: start download firmware size: 48056
-rk915: rk915_download: check downloaded fw failed         ← 0.6 ms later
-rk915: fw_bring_up: rk915_download_firmware failed
-WARNING: net/mac80211/util.c:1956 at ieee80211_reconfig    → every interface shut down
-```
+- **`patches/rk915-0004-reset-vif-accounting-on-hw-restart.patch`** — once
+  recovery started working, the *second* restart hit
+  `add_interface: Exceeded Maximum supported VIF's cur:2 max: 2`. mac80211
+  re-adds interfaces after a restart but never calls `remove_interface()` for the
+  old ones, and the accounting was only cleared by `rpu_init()` at module load.
+  Cleared in `start()` instead.
+- **`patches/rk915-0002-atomic-fw-error-claim.patch`** — `rk915_signal_io_error()`
+  claimed recovery with a plain test-then-set, so the rx and tx threads both got
+  through and `ieee80211_restart_hw()` was called twice, 163 µs apart. Now
+  `cmpxchg()`.
 
-So the driver detects the fault and tries to recover; the **firmware re-download
-is what fails**, and mac80211 then gives up. The entry point varies — sometimes
-the 0xF0F0 RX header, sometimes a TX write returning `-16` — but the recovery
-failure is always identical.
+### Result
 
-Two details pin it down:
+Measured on hardware with a reproducer that kills the link in ~10 s under inbound
+TCP (~0.1–0.5 MB):
 
-- `30550/48056 bytes differ` is the **same count every time**: that is simply how
-  many non-zero bytes the image has, i.e. *every* byte reads back as 0.
-- Download to verify-failed takes **0.6 ms**. 48 KB over SDIO at 50 MHz cannot
-  take less than ~8 ms, so the transfers are not reaching the bus at all.
-
-The card *is* genuinely power-cycled first (the 400 kHz → 50 MHz re-negotiation
-is in the log), so this is not a missing reset.
-
-### Two variants
-
-| Variant | Symptom | Recovers? |
+| Metric | Before | After |
 |---|---|---|
-| link death (common) | interface stops passing traffic, mac80211 shuts it down | **yes** — reloading the module restores it every time |
-| tx spin (seen once) | `rk915_tx` pins a CPU in the SDIO busy-wait; RCU stalls; display starves | **no** — `modprobe -r` hangs on the spinning thread; power cycle only |
+| firmware downloads during recovery | always failed | **31 succeeded, 0 failed** |
+| recoveries completed | 0 | **23** |
+| `Exceeded Maximum VIF` | yes | **0** |
+| link after a fault | dead until module reload | **returns by itself** |
+| interface name / DHCP lease | changed on every reload | **unchanged** |
 
-### What was tried and eliminated
+The driver now recovers in place: same `phy`, same interface, same lease, no
+module reload. Under sustained load the fault re-triggers and the driver simply
+recovers again, with the backoff visible in the log (1.7 s → 2.0 → 2.9 → 3.6 →
+6.4 → 8.7 → 12.2 → 15.9 s).
 
-All on hardware, against the reproducer below:
+### What is still not fixed
 
-| Change | Result |
-|---|---|
-| redo the fresh-probe chip/state setup in the recovery path | download still fails identically |
-| drop the stale `clk_claimed` so the SDIO irq is re-claimed after `mmc_hw_reset` | no change (it is already false by then) |
-| longer power-off — ruled out by reasoning: a module reload uses the *same* `rk915_sdio_power_cycle()` and succeeds | not attempted |
+The *underlying* fault still occurs — bulk traffic still trips
+`rk915_serias_read: length(61680) too long` or a tx write returning `-16`. What
+changed is that it is no longer fatal: recovery works, so it costs a brief blip
+instead of the link. Finding why the chip faults under load in the first place is
+a separate question, and the 0xF0F0 chained-header analysis below is where it
+starts.
 
-### What was fixed
-
-`patches/rk915-0002-atomic-fw-error-claim.patch`. `rk915_signal_io_error()`
-guarded recovery with a plain test-then-set, and the rx and tx threads both got
-through it — two recoveries 163 µs apart, `ieee80211_restart_hw()` called twice
-with the second landing mid-restart. Now claimed with `cmpxchg()`; verified on
-hardware, the same reproducer logs a single recovery. It does **not** make
-recovery succeed on its own.
-
-### The mitigation that works
-
-`system.d/rk915-recover.sh`, shipped and enabled by the package as a watchdog
-service. It polls the ring buffer for `fw_bring_up: rk915_download_firmware
-failed` and reloads the module, which restores the link reliably. It also does
-the same check 30 s after boot, since the driver can lose the same race while the
-system is starting.
-
-Validated end to end: two induced failures, two automatic recoveries, back on the
-network in well under two minutes each time.
-
-Caveats worth knowing:
-
-- Each reload renames the interface (`wlan5` → `wlan6` → …) and takes a new DHCP
-  lease, because udev keeps allocating fresh names.
-- It cannot help the tx-spin variant, where `modprobe -r` hangs.
-- It is a mitigation. The fault still happens; the link still drops for ~30-60 s.
-
-### Where a real fix should start
-
-The download writes are not reaching the bus — 0.6 ms and all-zero readback. The
-next step is to instrument `rk915_download()` itself and find whether `io_send`
-is returning an error that the download path swallows, or whether it is being
-short-circuited before the SDIO layer. Everything upstream of that (the reset,
-the bus re-init, the recovery bookkeeping) has been checked and is working.
-
-### Reproducing
-
-About 0.1-0.5 MB of inbound TCP kills it in ~10 seconds:
-
-```sh
-# on the device
-nc -l -p 9999 > /dev/null
-# from another machine
-python3 -c "import socket;s=socket.create_connection(('<device-ip>',9999));\
-[s.sendall(b'\0'*65536) for _ in range(4000)]"
-```
+`system.d/rk915-recover.sh` is kept as a backstop but should now essentially
+never fire, since it triggers on
+`fw_bring_up: rk915_download_firmware failed`, which no longer happens.
 
 ## The fault
 
