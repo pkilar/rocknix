@@ -11,13 +11,120 @@ is still booting** — roughly two boots in three. Once the system has settled,
 the driver is stable: reloading it after boot produced 300/300 and 396/400 pings
 with zero faults.
 
-The shipped fix is therefore a recovery unit, not a driver patch: if there is no
-default route 30 s after boot, reload `rk915` and restart `iwd`. Validated over
+The shipped fix is therefore a recovery unit, not a driver patch: 30 s after boot,
+**if the driver logged a fault**, reload `rk915` and restart `iwd`. Validated over
 three consecutive boots — all three ended with working networking, two of them
-after the unit logged `recovered`.
+after the unit logged `recovered`, and a later boot confirmed it correctly does
+nothing when the driver came up clean.
 
 A driver-level patch was written, built and tested, and is documented below as a
 **disproven hypothesis**. It is not shipped.
+
+⚠️ **There is a serious remaining limitation: a sustained transmit workload
+hard-freezes the device and needs a power cycle.** See the next section before
+relying on WiFi for anything more than light traffic.
+
+## Known limitation: sustained TX freezes the device
+
+**Do not use WiFi for large uploads on this device.** A sustained transmit
+workload — uploading a file through the built-in web server is the reproducer —
+locks the handheld up hard. It cannot be recovered from software; it needs a
+power cycle.
+
+### Symptom
+
+```
+rockchip-vop ff460000.vop: [drm:vop_crtc_atomic_flush] *ERROR* VOP vblank IRQ stuck for 10 ms
+[CRTC:39:crtc-0] vblank wait timed out
+WARNING: drivers/gpu/drm/drm_atomic_helper.c:1921 at drm_atomic_helper_wait_for_vblanks...
+rcu: INFO: rcu_sched self-detected stall on CPU
+rcu:     0-....: (6303 ticks this GP) ...
+CPU: 0 UID: 0 PID: 502 Comm: rk915_tx
+```
+
+The display warning is the loudest part of the log and it is **a symptom, not the
+cause**. The stalled task is `rk915_tx`, and the display is simply being starved.
+
+### Mechanism
+
+The stalled thread sits here, unchanged across two RCU reports 63 s apart:
+
+```
+dw_mci_start_command+0x58/0x120
+dw_mci_start_request / dw_mci_request / __mmc_start_request
+mmc_wait_for_req / mmc_io_rw_extended / sdio_io_rw_ext_helper
+sdio_memcpy_toio
+sdio_send_data [rk915] / rk915_data_write [rk915]
+rpu_send_cmd_datas [rk915] / tx_thread [rk915]
+```
+
+Two facts explain the freeze:
+
+1. **The chip has fallen off the SDIO bus.** The register dump carries
+   `x19: 00000000ffffffff` — the dw_mmc status register reading all-ones, which
+   is what a dead or unclocked bus returns. `SDMMC_STATUS_BUSY` can therefore
+   never clear.
+
+2. **The busy-wait is atomic.** `dw_mci_wait_while_busy()` polls for up to
+   **500 ms without sleeping**, on every data command:
+
+   ```c
+   if ((cmd_flags & SDMMC_CMD_PRV_DAT_WAIT) && !(cmd_flags & SDMMC_CMD_VOLT_SWITCH)) {
+           if (readl_poll_timeout_atomic(host->regs + SDMMC_STATUS, status,
+                                         !(status & SDMMC_STATUS_BUSY),
+                                         10, 500 * USEC_PER_MSEC))
+                   dev_err(host->dev, "Busy; trying anyway\n");
+   }
+   ```
+
+So once the chip dies, `rk915_tx` burns half a second of un-preemptible CPU per
+command and keeps submitting them. A CPU is pinned indefinitely — the stall
+counter went from 6303 to 25202 ticks (~250 s) across two reports. RCU stalls,
+the VOP's vblank IRQ misses its deadline, and DRM's commit worker times out
+waiting for it. **Nothing anywhere in the path ever concludes "the card is gone,
+stop trying".**
+
+### Why nothing recovers it
+
+| Attempt | Result |
+|---|---|
+| `rk915-recover.service` | runs once, 30 s after boot; this happens much later |
+| `ip link set wlan0 down` | deauthenticates, does not stop the TX thread |
+| `modprobe -r rk915` | **hangs** — the refcount cannot drop while `tx_thread` spins |
+| power cycle | the only way out |
+
+### What is and is not affected
+
+Measured stable: association, DHCP, browsing, and RX-dominated traffic — a
+10 pps / 1400-byte soak moved 3.24 MB with 1991/2000 pings, 0 driver faults,
+0 vblank timeouts, load average 0.71.
+
+Triggering: sustained **transmit**. Every soak run during the investigation was
+RX-dominated, which is why this was not caught earlier.
+
+This is **not** a panel or DTS bug. The display recovers completely on power
+cycle and normal boots show zero vblank timeouts.
+
+### Candidate fixes — none tried
+
+1. **Fail fast on a dead bus.** Treat an all-ones read in the rk915 SDIO path as
+   fatal: fail the transfer and let the driver's existing firmware-recovery run
+   instead of queueing more doomed commands. This would convert a freeze into a
+   link drop, which is recoverable. Most promising.
+2. **Re-evaluate `035-rk915-mmc-quirks.patch`.** It widens where
+   `SDMMC_CMD_PRV_DAT_WAIT` is set, and that flag is what arms the atomic spin.
+   It comes from a WIP upstream PR. Whether it contributes here is untested.
+3. `dw_mci_wait_while_busy()` has no notion of a removed or dead card. Any real
+   fix probably belongs there, but that is a core MMC change.
+
+Both (1) and (2) need a rebuild and reflash to evaluate, and two earlier
+driver-level hypotheses in this investigation were disproven on hardware — treat
+these as leads, not solutions.
+
+### Reproducing
+
+Upload a large file through the web server with the serial console attached.
+The freeze follows within seconds of sustained TX.
 
 ## The fault
 
@@ -192,6 +299,9 @@ evidence the parameter never did anything for the RX race.
   the interrupt window it opens. That is where a future attempt should start.
 - The failure rate without the recovery unit was measured at 2 of 3 boots on this
   unit, on this AP, on one night. Treat it as an order of magnitude, not a constant.
+- **Sustained TX hard-freezes the device** and needs a power cycle. This is the
+  most serious open problem in the port; see the limitation section above. The
+  recovery unit does not help — it runs once, at boot.
 
 ## Reproducing the fault
 

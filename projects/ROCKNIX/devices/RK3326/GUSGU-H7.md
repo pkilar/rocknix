@@ -330,6 +330,11 @@ the parameter. Costs idle power; the proper fix is to restore the wake path.
 
 ### WiFi works, via a recovery unit
 
+> ⚠️ **Limitation: sustained TX hard-freezes the device.** Uploading a large file
+> over WiFi pins a CPU in the SDIO busy-wait and locks the handheld up; only a
+> power cycle recovers it. Light traffic and RX-dominated workloads are stable.
+> Mechanism, evidence and candidate fixes: **`RK915-WIFI.md`**.
+
 The driver loses a race against boot-time system load and comes up with a dead
 link roughly **two boots in three**: it associates and usually gets a DHCP lease,
 then a few seconds later dies with
