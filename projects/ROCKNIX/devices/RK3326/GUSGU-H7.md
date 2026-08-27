@@ -5,8 +5,8 @@ Rockchip RK3326 handheld that ships a vendor EmuELEC 4.7 build. Everything here 
 derived from the device's own stock DTB and verified on hardware — nothing guessed.
 
 **Status:** boots to EmulationStation; display, audio, all 17 buttons, volume keys
-and the analog stick verified on hardware. WiFi (RK915) is integrated but unproven —
-see §8.
+and the analog stick verified on hardware. WiFi (RK915) associates; a sleep
+regression in the driver port is patched but not yet re-tested — see §8.
 
 ---
 
@@ -286,6 +286,46 @@ which is why this needs `compatible = "rockchip,rk915"` on the `wifi@1` node.
 
 Verified against pristine 7.1.2: applies with no fuzz, `SDIO_FIXUP_COMPATIBLE`
 exists, `struct mmc_card` has `.quirks`, and bits 21–23 are unused.
+
+
+### The sleep regression (found by diffing against the BSP)
+
+First hardware test got as far as **associating** (`status=0 aid=9`), then ~4 s later:
+
+```
+rk915: rk915_serias_read: length(61680) too long error.
+rk915: 30550/48056 bytes differ, first at 0x0 (wrote 0x81 read 0x00)
+```
+
+61680 = **0xF0F0** — both CMD52 byte reads in `rk915_read_data_len()` returning
+0xF0. Firmware recovery then fails because SDIO is already incoherent, and every
+mac80211 WARNING after that is just teardown of a device that is already gone.
+
+Verified *not* to be an integration fault: the card node's
+`compatible = "rockchip,rk915"` is bound (`/sys/bus/sdio/devices/mmc2:0001:1/
+of_node/compatible`), `mmc_fixup_of_compatible_match()` scans exactly that set of
+nodes, and `CLKENA = 0x1` shows the clock ungated. Bus is 50 MHz / 4-bit /
+SD-high-speed / 3.3 V, matching the stock tree.
+
+Diffing the port against the BSP driver in `docs/0001-rk915.patch` found the
+cause. `hal.c` went from 1971 to 883 lines, and among the deletions:
+
+```
+trigger_wakeup   check_and_wakeup_rpu_nonblocking   get_rpu_sleep_status
+trigger_timed_sleep
+```
+
+The BSP wakes the chip before touching it over SDIO (`hal.c:809`). The port
+dropped that path — but kept telling the firmware it may sleep, and also dropped
+the `module_param` that could have turned sleep off:
+
+| | BSP | port |
+|---|---|---|
+| | `unsigned int lpw_no_sleep = 0;`<br>`module_param(lpw_no_sleep, int, 0);` | `unsigned int lpw_no_sleep;` |
+
+So the chip sleeps during the first idle moment after association and never
+wakes. `patches/rk915-0001-keep-lmac-awake.patch` defaults it to 1 and restores
+the parameter. Costs idle power; the proper fix is to restore the wake path.
 
 ### The device tree
 
