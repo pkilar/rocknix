@@ -1,36 +1,36 @@
-mmc: dw_mmc: do not spin for 500ms when the host reads back all-ones
+mmc: dw_mmc: handle an all-ones register read as "host gone", not as work
 
-dw_mci_wait_while_busy() polls SDMMC_STATUS with readl_poll_timeout_atomic() for
-up to 500ms before every data command. The poll is atomic - no sleeping - and it
-runs with host->lock held and interrupts disabled.
+Two places treat a 0xffffffff read from an absent controller as meaningful:
 
-When the controller or card stops answering the register reads back 0xffffffff,
-so SDMMC_STATUS_BUSY is permanently set and every command burns the full 500ms.
-A driver that retries then pins the CPU indefinitely. Observed on a Gusgu H7
-(RK3326) when the RK915 SDIO wifi chip drops off the bus under load:
+1. dw_mci_wait_while_busy() polls SDMMC_STATUS with readl_poll_timeout_atomic()
+   for up to 500ms before every data command - atomic, host->lock held, irqs
+   disabled. All-ones means SDMMC_STATUS_BUSY is permanently set, so every
+   command burns the full 500ms and a retrying driver pins the CPU.
 
-    rcu: INFO: rcu_sched self-detected stall on CPU
-    CPU: 0 UID: 0 PID: 491 Comm: rk915_tx
-    pc : dw_mci_start_command+0x58/0x120
-    x19: 00000000ffffffff
-    Call trace:
-     dw_mci_start_command+0x58/0x120 (P)
-     ...
-     sdio_memcpy_toio+0x20/0x28
-     sdio_send_data+0x24/0x2c [rk915]
-     tx_thread+0x24c/0x2c0 [rk915]
+2. dw_mci_interrupt() reads MINTSTS and, if non-zero, services it. All-ones
+   means it "handles" all 32 bits, the writes to RINTSTS go nowhere, and since
+   the line is level triggered it is re-entered immediately.
 
-x19 is the status readback. Interrupts stop being serviced on that CPU, so the
-display stalls waiting for vblank, the network dies, and the machine wedges hard
-enough that printk stops coming out - only a power cycle recovers it. The wifi
-driver never gets an error back either, so its own firmware error recovery is
-never entered.
+(2) is the more damaging: measured at ~690,000 interrupts/second on a Gusgu H7
+(RK3326) when the RK915 SDIO wifi chip drops off the bus under concurrent load.
+Per-irq tracing during the hang:
 
-An all-ones read is not a valid status; it means the host is not there. Break out
-of the poll and let the command time out normally so the error propagates.
+    IRQTRACE 32 timer=57321/62722/55965/64999 dwmci: 54:3363849 vop=6888 adc=13510
+    IRQTRACE 33 timer=57627/63111/56569/65405 dwmci: 54:4053907 vop=6888 adc=13510
 
---- a/drivers/mmc/host/dw_mmc.c	2026-08-27 14:58:25.299267010 -0400
-+++ b/drivers/mmc/host/dw_mmc.c	2026-08-27 14:58:25.300177951 -0400
+irq 54 is mmc@ff380000 (the sdio host). Every other CPU0-affine interrupt is
+frozen: the VOP stops (drm vblank timeouts), the SARADC stops (joypad error
+spam), the network dies. RCU then stalls because the CPU is permanently in irq
+context entered from idle, so it never reaches an extended quiescent state -
+the stall report shows it in default_idle_call() looking idle, which is
+misleading; it is being re-interrupted between every WFI.
+
+An all-ones read is not data. Bail out in both places: let the command time out
+normally so the error reaches the driver, and return IRQ_NONE so the spurious
+irq machinery can shut the line down.
+
+--- a/drivers/mmc/host/dw_mmc.c	2026-08-27 16:48:54.029757320 -0400
++++ b/drivers/mmc/host/dw_mmc.c	2026-08-27 16:48:54.030904680 -0400
 @@ -213,11 +213,26 @@
  	 */
  	if ((cmd_flags & SDMMC_CMD_PRV_DAT_WAIT) &&
@@ -58,3 +58,28 @@ of the poll and let the command time out normally so the error propagates.
  	}
  }
  
+@@ -2674,6 +2689,24 @@
+ 
+ 	pending = mci_readl(host, MINTSTS); /* read-only mask reg */
+ 
++	/*
++	 * An all-ones read means the controller is not answering - unclocked,
++	 * powered down, or the card fell off the bus - not that every interrupt
++	 * is pending. Servicing it "handles" all 32 bits, the writes to RINTSTS
++	 * go nowhere, and because the line is level triggered we are re-entered
++	 * immediately: a ~690k/s storm that starves every other interrupt on the
++	 * CPU. On a Gusgu H7 that stops the VOP (vblank timeouts), the SARADC
++	 * (joypad error spam) and the network, and RCU stalls because the CPU is
++	 * permanently in irq context entered from idle - the machine appears to
++	 * hang. Return IRQ_NONE so the spurious-irq machinery can shut the line
++	 * down instead of the CPU spinning on it forever.
++	 */
++	if (pending == ~0U) {
++		dev_err_ratelimited(host->dev,
++				    "host not responding, MINTSTS=~0; ignoring\n");
++		return IRQ_NONE;
++	}
++
+ 	if (pending) {
+ 		/* Check volt switch first, since it can look like an error */
+ 		if ((host->state == STATE_SENDING_CMD11) &&
