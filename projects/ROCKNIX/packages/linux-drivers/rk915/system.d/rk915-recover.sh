@@ -1,33 +1,53 @@
 #!/bin/sh
-# Reload rk915 when the driver lost the boot-time RX race (see RK915-WIFI.md).
+# rk915 watchdog.
 #
-# The test is "did the driver actually fault", NOT "is there a default route".
-# With WiFi unconfigured, out of range, or simply unused there is no route and
-# no fault, and reloading would churn the driver and restart iwd underneath the
-# user - including renaming wlan0 to wlan1, which is visible in the UI.
+# The driver detects its own firmware faults and asks mac80211 to restart the
+# hardware, but the firmware re-download that follows always fails
+# ("N/48056 bytes differ, first at 0x0"), so mac80211 gives up and shuts the
+# interface down and the link never comes back. Reloading the module does
+# restore it, reliably. Watch for that signature and do exactly that.
 #
-# "rx_thread: error datalen" is deliberately not in this list: it is also seen
-# once on a healthy interface bring-up, so it is not decisive on its own.
-FAULTS='rk915: .*(too long error|fw error recovery|No reset complete|check downloaded fw failed|rk915_download_firmware failed)'
+# See RK915-WIFI.md. This is a mitigation, not a fix: the underlying fault is
+# unresolved, and it cannot help the variant where the tx thread spins in the
+# SDIO busy-wait, because modprobe -r hangs there.
+DEAD='fw_bring_up: rk915_download_firmware failed'
+COOLDOWN=60
+POLL=5
 
+reload_driver() {
+        logger -t rk915-recover "link is dead - reloading rk915"
+        modprobe -r rk915
+        sleep 3
+        modprobe cfg80211 2>/dev/null
+        modprobe mac80211 2>/dev/null
+        modprobe rk915
+        sleep 10
+        systemctl restart iwd
+        sleep 20
+        if ip route | grep -q '^default'; then
+                logger -t rk915-recover "recovered"
+        else
+                logger -t rk915-recover "still down after reload"
+        fi
+}
+
+# Boot-time check: the driver can lose the same race while the system is busy
+# starting up.
 sleep 30
-
-if ! dmesg | grep -qE "$FAULTS"; then
-  logger -t rk915-recover "no driver fault logged, leaving it alone"
-  exit 0
+seen=$(dmesg | grep -c "$DEAD")
+if [ "$seen" -gt 0 ]; then
+        reload_driver
+        seen=$(dmesg | grep -c "$DEAD")
 fi
 
-mark=$(dmesg | wc -l)
-logger -t rk915-recover "driver fault detected, reloading rk915"
-modprobe -r rk915
-sleep 3
-modprobe rk915
-sleep 10
-systemctl restart iwd
-sleep 20
-
-if dmesg | tail -n +$((mark + 1)) | grep -qE "$FAULTS"; then
-  logger -t rk915-recover "still faulting after reload"
-else
-  logger -t rk915-recover "recovered"
-fi
+while true; do
+        sleep $POLL
+        now=$(dmesg | grep -c "$DEAD")
+        if [ "$now" -gt "$seen" ]; then
+                reload_driver
+                seen=$(dmesg | grep -c "$DEAD")
+                sleep $COOLDOWN
+        elif [ "$now" -lt "$seen" ]; then
+                seen=$now          # ring buffer wrapped
+        fi
+done

@@ -1,11 +1,12 @@
 [Unit]
-Description=Recover rk915 WiFi if the boot-time probe lost the RX race
+Description=rk915 WiFi watchdog (reload the driver when firmware recovery fails)
 After=multi-user.target
 Wants=multi-user.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
+Restart=always
+RestartSec=10
 ExecStart=/usr/lib/rk915/rk915-recover.sh
 
 [Install]

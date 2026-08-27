@@ -36,10 +36,10 @@ makeinstall_target() {
   mkdir -p ${INSTALL}/$(get_kernel_overlay_dir)/lib/firmware/rockchip
     cp -av firmware/rockchip/rk915_fw.bin firmware/rockchip/rk915_patch.bin \
        ${INSTALL}/$(get_kernel_overlay_dir)/lib/firmware/rockchip
-  # See GUSGU-H7.md "WiFi": the driver loses a race against boot-time load
-  # roughly two boots in three and comes up with a dead link. Reloading it once
-  # the system has settled is reliable, so ship a unit that does exactly that,
-  # and only when the driver actually logged a fault.
+  # See RK915-WIFI.md: the driver detects its own firmware faults and asks
+  # mac80211 to restart, but the re-download that follows always fails, so the
+  # link never comes back. Reloading the module does restore it, reliably, so
+  # ship a watchdog that watches for that signature and does exactly that.
   mkdir -p ${INSTALL}/usr/lib/systemd/system
     cp ${PKG_DIR}/system.d/rk915-recover.service ${INSTALL}/usr/lib/systemd/system
   mkdir -p ${INSTALL}/usr/lib/rk915

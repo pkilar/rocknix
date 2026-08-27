@@ -84,47 +84,100 @@ the VOP's vblank IRQ misses its deadline, and DRM's commit worker times out
 waiting for it. **Nothing anywhere in the path ever concludes "the card is gone,
 stop trying".**
 
-### Why nothing recovers it
+### The failure chain
 
-| Attempt | Result |
+Traced with the driver's own logging (safe once `console_loglevel` is 1, which
+keeps printk in the ring buffer and off the 1.5 Mbaud console):
+
+```
+rk915: rk915_serias_read: length(61680) too long error.   ← the 0xF0F0 header bug
+rk915: fw error (0): requesting mac80211 restart          ← driver DOES detect it
+ieee80211 phy4: Hardware restart was requested
+mmc_host mmc2: Bus speed = 400000Hz  →  50000000Hz        ← card really is power-cycled
+rk915: rk915_download: start download firmware size: 48056
+rk915: rk915_download: check downloaded fw failed         ← 0.6 ms later
+rk915: fw_bring_up: rk915_download_firmware failed
+WARNING: net/mac80211/util.c:1956 at ieee80211_reconfig    → every interface shut down
+```
+
+So the driver detects the fault and tries to recover; the **firmware re-download
+is what fails**, and mac80211 then gives up. The entry point varies — sometimes
+the 0xF0F0 RX header, sometimes a TX write returning `-16` — but the recovery
+failure is always identical.
+
+Two details pin it down:
+
+- `30550/48056 bytes differ` is the **same count every time**: that is simply how
+  many non-zero bytes the image has, i.e. *every* byte reads back as 0.
+- Download to verify-failed takes **0.6 ms**. 48 KB over SDIO at 50 MHz cannot
+  take less than ~8 ms, so the transfers are not reaching the bus at all.
+
+The card *is* genuinely power-cycled first (the 400 kHz → 50 MHz re-negotiation
+is in the log), so this is not a missing reset.
+
+### Two variants
+
+| Variant | Symptom | Recovers? |
+|---|---|---|
+| link death (common) | interface stops passing traffic, mac80211 shuts it down | **yes** — reloading the module restores it every time |
+| tx spin (seen once) | `rk915_tx` pins a CPU in the SDIO busy-wait; RCU stalls; display starves | **no** — `modprobe -r` hangs on the spinning thread; power cycle only |
+
+### What was tried and eliminated
+
+All on hardware, against the reproducer below:
+
+| Change | Result |
 |---|---|
-| `rk915-recover.service` | runs once, 30 s after boot; this happens much later |
-| `ip link set wlan0 down` | deauthenticates, does not stop the TX thread |
-| `modprobe -r rk915` | **hangs** — the refcount cannot drop while `tx_thread` spins |
-| power cycle | the only way out |
+| redo the fresh-probe chip/state setup in the recovery path | download still fails identically |
+| drop the stale `clk_claimed` so the SDIO irq is re-claimed after `mmc_hw_reset` | no change (it is already false by then) |
+| longer power-off — ruled out by reasoning: a module reload uses the *same* `rk915_sdio_power_cycle()` and succeeds | not attempted |
 
-### What is and is not affected
+### What was fixed
 
-Measured stable: association, DHCP, browsing, and RX-dominated traffic — a
-10 pps / 1400-byte soak moved 3.24 MB with 1991/2000 pings, 0 driver faults,
-0 vblank timeouts, load average 0.71.
+`patches/rk915-0002-atomic-fw-error-claim.patch`. `rk915_signal_io_error()`
+guarded recovery with a plain test-then-set, and the rx and tx threads both got
+through it — two recoveries 163 µs apart, `ieee80211_restart_hw()` called twice
+with the second landing mid-restart. Now claimed with `cmpxchg()`; verified on
+hardware, the same reproducer logs a single recovery. It does **not** make
+recovery succeed on its own.
 
-Triggering: sustained **transmit**. Every soak run during the investigation was
-RX-dominated, which is why this was not caught earlier.
+### The mitigation that works
 
-This is **not** a panel or DTS bug. The display recovers completely on power
-cycle and normal boots show zero vblank timeouts.
+`system.d/rk915-recover.sh`, shipped and enabled by the package as a watchdog
+service. It polls the ring buffer for `fw_bring_up: rk915_download_firmware
+failed` and reloads the module, which restores the link reliably. It also does
+the same check 30 s after boot, since the driver can lose the same race while the
+system is starting.
 
-### Candidate fixes — none tried
+Validated end to end: two induced failures, two automatic recoveries, back on the
+network in well under two minutes each time.
 
-1. **Fail fast on a dead bus.** Treat an all-ones read in the rk915 SDIO path as
-   fatal: fail the transfer and let the driver's existing firmware-recovery run
-   instead of queueing more doomed commands. This would convert a freeze into a
-   link drop, which is recoverable. Most promising.
-2. **Re-evaluate `035-rk915-mmc-quirks.patch`.** It widens where
-   `SDMMC_CMD_PRV_DAT_WAIT` is set, and that flag is what arms the atomic spin.
-   It comes from a WIP upstream PR. Whether it contributes here is untested.
-3. `dw_mci_wait_while_busy()` has no notion of a removed or dead card. Any real
-   fix probably belongs there, but that is a core MMC change.
+Caveats worth knowing:
 
-Both (1) and (2) need a rebuild and reflash to evaluate, and two earlier
-driver-level hypotheses in this investigation were disproven on hardware — treat
-these as leads, not solutions.
+- Each reload renames the interface (`wlan5` → `wlan6` → …) and takes a new DHCP
+  lease, because udev keeps allocating fresh names.
+- It cannot help the tx-spin variant, where `modprobe -r` hangs.
+- It is a mitigation. The fault still happens; the link still drops for ~30-60 s.
+
+### Where a real fix should start
+
+The download writes are not reaching the bus — 0.6 ms and all-zero readback. The
+next step is to instrument `rk915_download()` itself and find whether `io_send`
+is returning an error that the download path swallows, or whether it is being
+short-circuited before the SDIO layer. Everything upstream of that (the reset,
+the bus re-init, the recovery bookkeeping) has been checked and is working.
 
 ### Reproducing
 
-Upload a large file through the web server with the serial console attached.
-The freeze follows within seconds of sustained TX.
+About 0.1-0.5 MB of inbound TCP kills it in ~10 seconds:
+
+```sh
+# on the device
+nc -l -p 9999 > /dev/null
+# from another machine
+python3 -c "import socket;s=socket.create_connection(('<device-ip>',9999));\
+[s.sendall(b'\0'*65536) for _ in range(4000)]"
+```
 
 ## The fault
 

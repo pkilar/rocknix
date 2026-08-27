@@ -330,10 +330,13 @@ the parameter. Costs idle power; the proper fix is to restore the wake path.
 
 ### WiFi works, via a recovery unit
 
-> ⚠️ **Limitation: sustained TX hard-freezes the device.** Uploading a large file
-> over WiFi pins a CPU in the SDIO busy-wait and locks the handheld up; only a
-> power cycle recovers it. Light traffic and RX-dominated workloads are stable.
-> Mechanism, evidence and candidate fixes: **`RK915-WIFI.md`**.
+> ⚠️ **Limitation: throughput kills the link.** Roughly 0.1-0.5 MB of bulk
+> traffic drops WiFi within ~10 s. The driver detects the fault and asks
+> mac80211 to restart, but the firmware re-download always fails, so the link
+> would never return on its own. A watchdog service reloads the module, which
+> restores it reliably (validated); expect a ~30-60 s outage, a renamed
+> interface and a new DHCP lease. One rarer variant instead pins a CPU in the
+> SDIO busy-wait and needs a power cycle. Full analysis: **`RK915-WIFI.md`**.
 
 The driver loses a race against boot-time system load and comes up with a dead
 link roughly **two boots in three**: it associates and usually gets a DHCP lease,
