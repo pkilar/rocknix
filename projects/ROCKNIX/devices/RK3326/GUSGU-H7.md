@@ -37,7 +37,7 @@ A copy of the stock DTB lives in `packages/u-boot/config/stock/` for the
 | `packages/u-boot/config/stock/…dtb` | stock DTB for the on-device wizard |
 | `projects/ROCKNIX/config.xml` → `<h7>` | registers the subdevice |
 | `projects/ROCKNIX/bootloader/mkimage` | per-subdevice extlinux hook (2 lines + comment) |
-| `patches/linux/035-rk915-sdio-quirks.patch` | MMC quirks for the RK915 WiFi chip (§8) |
+| `patches/linux/035-rk915-mmc-quirks.patch` | MMC card quirks for the RK915 WiFi chip (§8) |
 | `projects/ROCKNIX/packages/linux-drivers/rk915/` | RK915 driver + firmware package |
 | `devices/RK3326/options` | `ADDITIONAL_DRIVERS += rk915` |
 
@@ -239,39 +239,53 @@ Three pieces are needed, all present in this tree:
 
 | Piece | Where |
 |---|---|
-| MMC core/host quirks | `patches/linux/035-rk915-sdio-quirks.patch` |
+| MMC card quirks | `patches/linux/035-rk915-mmc-quirks.patch` |
 | Driver + firmware | `packages/linux-drivers/rk915/`, pulled in via `ADDITIONAL_DRIVERS` |
 | SDIO reconfiguration | `&sdio` / `sdio_pwrseq` / `&pinctrl` in the DTS |
 
 ### The driver
 
-An out-of-tree mainline port by Danil Zagoskin (a ROCKNIX developer):
-<https://github.com/stolen/rk915>, itself a port of the vendor BSP driver.
+An out-of-tree mainline port originally by Danil Zagoskin, a ROCKNIX developer
+(<https://github.com/stolen/rk915>). We pin to the head of **PR #2**
+(`sunshineinabox`, branch `WIP-RK915_7.1`), which is a substantial rework:
 
-The firmware blobs it ships (`rk915_fw.bin`, `rk915_patch.bin`) are **byte-identical**
-to those in the stock EmuELEC image (md5 `a0e5ed75…` / `6c1f8ec6…`), confirming it
-targets this exact chip revision.
+- **targets Linux 7.1** — upstream `main` still targets 6.12.29
+- moves the kernel-side changes onto the **standard MMC card-quirks framework**
+  instead of vendor hacks in the MMC core
+- loads firmware via `request_firmware` as `rockchip/rk915_{fw,patch}.bin`
+- drops driver globals, rooting device state in `drvdata` and the HAL lifecycle in
+  probe (relevant to the unload-stall defect)
+- several genuine bug fixes: missing braces on basic-rate/txq params, gating
+  `RX_FLAG_DECRYPTED` on the protected bit, one SDIO claim per TX descriptor with
+  full TX status reporting, and reporting all disconnect reasons
 
-⚠️ **Upstream describes the driver as "not usable yet"**, with two known defects:
-the chip disconnects soon after association, and unloading the module can stall the
-system. That work stopped in July 2025. Everything here is the *integration*; whether
-the link is actually stable is unverified.
+The firmware blobs are **byte-identical** to those in the stock EmuELEC image
+(md5 `a0e5ed75…` / `6c1f8ec6…`), confirming the driver targets this exact chip
+revision.
+
+⚠️ **PR #2 is a draft.** Its author wrote *"I may not get to look at this again for
+awhile"*, and its README still carries the original status — chip disconnects soon
+after association, unloading may stall the system. Several of its commits look
+aimed squarely at those defects, but nothing here is verified on hardware. This
+is the integration; link stability is unproven.
 
 ### The kernel quirks
 
-The RK915 is not a conforming SDIO card. `035-rk915-sdio-quirks.patch` adds
-`MMC_CAP2_WIFI_RK912` (bit 29, free in 7.1.2), opted into per controller with the
-`supports-rk912` property — the name the vendor device trees already use — so no
-other device is affected. It:
+`035-rk915-mmc-quirks.patch` registers three named card quirks via
+`SDIO_FIXUP_COMPATIBLE("rockchip,rk915", ...)` in `drivers/mmc/core/quirks.h` —
+the same mechanism upstream already uses for `ti,wl1251` and `silabs,wf200`:
 
-- tolerates a CIS shorter than the spec minimum (`sdio_cis.c`)
-- skips re-powering the card on resume (`sdio.c`)
-- forces `PRV_DAT_WAIT` on `SD_IO_RW_DIRECT` and disables low-power clock gating
-  (`dw_mmc.c`)
+| Quirk | Effect |
+|---|---|
+| `MMC_QUIRK_BROKEN_SDIO_FUNCE` | tolerate a short `CISTPL_FUNCE` (still requires ≥14 bytes), fall back to SDIO 1.0 defaults |
+| `MMC_QUIRK_SDIO_CONT_CLOCK` | never enable dw_mmc low-power clock gating |
+| `MMC_QUIRK_SDIO_CMD52_WAIT_DATA` | assert `PRV_DAT_WAIT` on `SD_IO_RW_DIRECT`, except on the abort path |
 
-Ported from the upstream 6.12.29 patch; two hunks needed adjusting because dw_mmc
-dropped multi-slot support since then, so `slot->flags` / `slot->mmc` became
-`host->flags` / `host->mmc`. Verified to apply cleanly to pristine 7.1.2.
+Because the match is on the card's `compatible`, no other device is affected —
+which is why this needs `compatible = "rockchip,rk915"` on the `wifi@1` node.
+
+Verified against pristine 7.1.2: applies with no fuzz, `SDIO_FIXUP_COMPATIBLE`
+exists, `struct mmc_card` has `.quirks`, and bits 21–23 are unused.
 
 ### The device tree
 
@@ -279,7 +293,7 @@ eeclone's `&sdio` sets `cd-gpios = <&gpio0 RK_PA2>`. On the H7 that pin is
 `WIFI,poweren_gpio` — so the DT holds the power-enable line as a card-detect input
 and the chip never powers up. The DTS deletes the SD-card properties, adds an
 `mmc-pwrseq-simple` driving `gpio0 RK_PA2`, and sets the values from the stock tree
-(50 MHz, `cap-sd-highspeed`, `keep-power-in-suspend`, `supports-rk912`).
+(50 MHz, `cap-sd-highspeed`, `keep-power-in-suspend`), plus `non-removable`.
 
 Host-wake is `gpio0 RK_PA1`, from the stock `WIFI,host_wake_irq`. The upstream
 driver's example dtsi uses `RK_PA5` — that is its author's board, not this one.

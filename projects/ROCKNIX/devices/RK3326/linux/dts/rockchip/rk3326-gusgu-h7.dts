@@ -425,8 +425,8 @@
  * on the bus (mmc2 comes up, no card enumerates, no wlan0).
  *
  * Values below match the stock device tree: 50 MHz, cap-sd-highspeed,
- * keep-power-in-suspend and supports-rk912 - the last is consumed by
- * 035-rk915-sdio-quirks.patch. host-wake is gpio0 RK_PA1 per the stock
+ * keep-power-in-suspend and non-removable. The card node's
+ * compatible = "rockchip,rk915" is what 035-rk915-mmc-quirks.patch matches on. host-wake is gpio0 RK_PA1 per the stock
  * WIFI,host_wake_irq (the upstream driver's example dtsi uses RK_PA5, which is
  * that author's board, not this one).
  */
@@ -446,10 +446,11 @@
 	max-frequency = <50000000>;
 	no-sd;
 	no-mmc;
-	supports-rk912;
+	non-removable;
 	status = "okay";
 
 	wifi@1 {
+		compatible = "rockchip,rk915";
 		reg = <1>;
 		interrupt-names = "host-wake";
 		interrupt-parent = <&gpio0>;

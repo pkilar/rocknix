@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
 PKG_NAME="rk915"
-PKG_VERSION="590fe1dd3fa9569117317b2e0dcbe02c42f8419e"
-PKG_SHA256="2338c1583c0662e6e1c8f5992b416617ee39b382d3bf8e2a422ffe7b1ef9cfe5"
+PKG_VERSION="86f0d0e07afe156651ce5eec3e315f66ef79a59f"
+PKG_SHA256="27ca0f8ce96e62a0b28d0404a0516a2d188df1d5a7a5a3f9c98ad4944e9581c8"
 PKG_LICENSE="GPL"
-PKG_SITE="https://github.com/stolen/rk915"
+PKG_SITE="https://github.com/sunshineinabox/rk915"
 PKG_URL="${PKG_SITE}/archive/${PKG_VERSION}.tar.gz"
 PKG_LONGDESC="rk915: Rockchip RK915 SDIO WiFi driver, mainline port"
+
+# Pinned to the head of https://github.com/stolen/rk915/pull/2, which targets
+# Linux 7.1 and moves the kernel-side changes onto the standard MMC card-quirks
+# framework. The upstream main branch still targets 6.12.
+
 PKG_TOOLCHAIN="manual"
 PKG_IS_KERNEL_PKG="yes"
 
-# Needs the MMC quirks from 035-rk915-sdio-quirks.patch: the chip has a short
-# CIS, must not be re-powered on resume, and needs the dw_mmc clock ungated.
+# Needs 035-rk915-mmc-quirks.patch, which registers the card quirks this driver
+# relies on, keyed off compatible = "rockchip,rk915" in the DT.
 
 pre_make_target() {
   unset LDFLAGS
@@ -25,9 +30,10 @@ makeinstall_target() {
   mkdir -p ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}
     cp *.ko ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}
 
-  # rk915_fw.bin / rk915_patch.bin - byte-identical to the blobs shipped by the
-  # vendor EmuELEC build, so this is the right firmware for the chip revision.
-  mkdir -p ${INSTALL}/$(get_kernel_overlay_dir)/lib/firmware
-    cp -av firmware/rk915_fw.bin firmware/rk915_patch.bin \
-       ${INSTALL}/$(get_kernel_overlay_dir)/lib/firmware
+  # Loaded via request_firmware as "rockchip/rk915_fw.bin" and
+  # "rockchip/rk915_patch.bin" (inc/firmware.h). Byte-identical to the blobs in
+  # the vendor EmuELEC image, so this is the right firmware for the revision.
+  mkdir -p ${INSTALL}/$(get_kernel_overlay_dir)/lib/firmware/rockchip
+    cp -av firmware/rockchip/rk915_fw.bin firmware/rockchip/rk915_patch.bin \
+       ${INSTALL}/$(get_kernel_overlay_dir)/lib/firmware/rockchip
 }
