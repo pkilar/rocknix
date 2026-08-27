@@ -1,56 +1,49 @@
-mmc: dw_mmc: mask TXDR/RXDR during DMA transfers
+mmc: dw_mmc: survive a card that stops responding mid-transfer
 
-TXDR and RXDR mean "the FIFO needs servicing by the CPU". They are only
-meaningful for PIO: dw_mci_submit_data() enables them on the PIO path, right
-after setting host->sg, and the DMA path deliberately does not.
+Two independent problems, both triggered on a Gusgu H7 (RK3326) when the RK915
+sdio wifi chip drops off the bus under concurrent load.
 
-But the initial INTMASK written in dw_mci_probe()/dw_mci_init_slot() enables
-TXDR|RXDR unconditionally, and nothing ever turns them off again. So they also
-fire throughout every DMA transfer, where host->sg is NULL and the handler can
-do nothing but clear the latch:
+1. TXDR/RXDR are only meaningful for PIO. dw_mci_submit_data() enables them on
+   the PIO path, right after setting host->sg, and the DMA path deliberately does
+   not - but the initial INTMASK enables them unconditionally and nothing ever
+   turns them off, so they also fire throughout every DMA transfer where
+   host->sg is NULL and the handler can only clear the latch. Harmless while the
+   DMA drains the FIFO; not harmless when the card dies, because the FIFO
+   condition then persists and the level-triggered line storms. Measured at
+   ~684,000 interrupts/second, with every other interrupt on that CPU frozen:
 
-	if (pending & SDMMC_INT_TXDR) {
-		mci_writel(host, RINTSTS, SDMMC_INT_TXDR);
-		if (host->dir_status == MMC_DATA_WRITE && host->sg)
-			dw_mci_write_data_pio(host);
-	}
+       IRQTRACE 344 dwmci: 56:164736147  vop=11531 adc=24734 ser=418 gpio=10946
+       IRQTRACE 345 dwmci: 56:165433415  vop=11531 adc=24734 ser=418 gpio=10946
 
-Normally that is harmless - the DMA drains the FIFO, the condition clears, the
-interrupt stops. If the card stops responding mid-transfer it is not: the FIFO
-condition persists, clearing the latch achieves nothing, and because the line is
-level triggered the handler is re-entered immediately. TMOUT is programmed to
-0xFFFFFFFF, so the data timeout never fires to abort the dead transfer either.
+   All device interrupts on this board are affine to CPU0, so the VOP stops (drm
+   vblank timeouts), the SARADC stops (joypad error spam) and the network dies -
+   the machine has to be power cycled. Mask them for the duration of a DMA
+   transfer; the PIO path re-enables them when it needs them.
 
-Captured on a Gusgu H7 (RK3326) with an RK915 sdio wifi chip, by dumping the
-controller state every 200000th interrupt:
+2. The software data timeout is armed for reads only. A write to a card that has
+   stopped responding therefore has no timeout at all - the hardware data timeout
+   does not cover the write data phase - so mmc_wait_for_req() waits forever:
 
-    DWDIAG MINTSTS=00000010 INTMASK=0100b7ff RINTSTS=00010010 STATUS=00ffaf02
-           IDSTS=00000000 dir=256 sg=0 state=1 cmd=53
+       task:rk915_tx  state:D
+         wait_for_completion / mmc_wait_for_req_done / mmc_io_rw_extended
+         / sdio_memcpy_toio / rk915_data_write [rk915] / tx_thread [rk915]
+       task:rk915_rx  state:D
+         __mmc_claim_host / sdio_claim_host / rk915_serias_read [rk915]
 
-MINTSTS 0x10 is TXDR, dir 256 is MMC_DATA_WRITE, sg=0, cmd 53. Per-irq tracing
-put the rate at ~684,000 interrupts/second on irq 56 (mmc@ff380000):
+   The rx thread is simply queued behind the tx thread on the host lock. The
+   driver never sees an error, so its firmware recovery never runs, and the
+   module cannot be unloaded. Arm dw_mci_set_drto() for writes as well. The
+   timeout it computes comes from TMOUT, which dw_mci_set_data_timeout()
+   programs per request from data->timeout_ns, so it is the timeout the core
+   asked for rather than an arbitrary one.
 
-    IRQTRACE 344 dwmci: 56:164736147  vop=11531 adc=24734 ser=418 gpio=10946
-    IRQTRACE 345 dwmci: 56:165433415  vop=11531 adc=24734 ser=418 gpio=10946
-
-Every other interrupt on that CPU is frozen at a fixed count. All device
-interrupts on this board are affine to CPU0, so the VOP stops (drm vblank
-timeouts), the SARADC stops (joypad error spam) and the network dies - the
-machine has to be power cycled. The RCU stall it produces reports the CPU in
-default_idle_call(), which reads as an idle CPU but is not: it is re-interrupted
-between every WFI. That cost several rounds of this investigation; cpuidle.off=1
-and nohz=off were both tried and changed nothing.
-
-Mask TXDR/RXDR for the duration of a DMA transfer. The PIO path re-enables them
-when it needs them.
-
-Also included, found earlier in the same hunt and kept: dw_mci_wait_while_busy()
+Also included, found earlier in the same investigation: dw_mci_wait_while_busy()
 would spin its full 500ms atomic poll on an all-ones SDMMC_STATUS read, and
-dw_mci_interrupt() would service all 32 bits of an all-ones MINTSTS. Neither is
-data; bail out instead. Neither turned out to be this storm.
+dw_mci_interrupt() would service all 32 bits of an all-ones MINTSTS. Neither
+value is data; bail out instead.
 
---- a/drivers/mmc/host/dw_mmc.c	2026-08-27 17:32:17.257446504 -0400
-+++ b/drivers/mmc/host/dw_mmc.c	2026-08-27 17:32:17.258474699 -0400
+--- a/drivers/mmc/host/dw_mmc.c	2026-08-27 19:57:40.515908848 -0400
++++ b/drivers/mmc/host/dw_mmc.c	2026-08-27 19:57:40.516985159 -0400
 @@ -213,11 +213,26 @@
  	 */
  	if ((cmd_flags & SDMMC_CMD_PRV_DAT_WAIT) &&
@@ -141,7 +134,59 @@ data; bail out instead. Neither turned out to be this storm.
  static void __dw_mci_enable_sdio_irq(struct dw_mci *host, int enb)
  {
  	unsigned long irqflags;
-@@ -2674,6 +2738,45 @@
+@@ -2025,10 +2089,31 @@
+ 						&host->pending_events)) {
+ 				/*
+ 				 * If all data-related interrupts don't come
+-				 * within the given time in reading data state.
++				 * within the given time.
++				 *
++				 * This used to be armed for reads only. A write
++				 * to a card that stops responding then has no
++				 * timeout at all: the hardware data timeout does
++				 * not cover the write data phase, so
++				 * mmc_wait_for_req() waits forever. Observed on
++				 * an RK3326 with an RK915 sdio wifi chip, with
++				 * the tx thread parked indefinitely:
++				 *
++				 *   task:rk915_tx  state:D
++				 *     wait_for_completion
++				 *     mmc_wait_for_req_done
++				 *     mmc_io_rw_extended
++				 *     sdio_memcpy_toio
++				 *     tx_thread [rk915]
++				 *
++				 * and the rx thread queued behind it on the host
++				 * lock, so the driver never errors out, never
++				 * recovers, and the module cannot be unloaded.
++				 * The timeout is computed from TMOUT, which is
++				 * programmed per request from data->timeout_ns,
++				 * so it is the timeout the core asked for.
+ 				 */
+-				if (host->dir_status == MMC_DATA_READ)
+-					dw_mci_set_drto(host);
++				dw_mci_set_drto(host);
+ 				break;
+ 			}
+ 
+@@ -2063,12 +2148,11 @@
+ 		case STATE_DATA_BUSY:
+ 			if (!dw_mci_clear_pending_data_complete(host)) {
+ 				/*
+-				 * If data error interrupt comes but data over
+-				 * interrupt doesn't come within the given time.
+-				 * in reading data state.
++				 * If a data error interrupt comes but data over
++				 * does not follow within the given time. Armed
++				 * for writes as well, for the reason above.
+ 				 */
+-				if (host->dir_status == MMC_DATA_READ)
+-					dw_mci_set_drto(host);
++				dw_mci_set_drto(host);
+ 				break;
+ 			}
+ 
+@@ -2674,6 +2758,45 @@
  
  	pending = mci_readl(host, MINTSTS); /* read-only mask reg */
  
@@ -187,7 +232,7 @@ data; bail out instead. Neither turned out to be this storm.
  	if (pending) {
  		/* Check volt switch first, since it can look like an error */
  		if ((host->state == STATE_SENDING_CMD11) &&
-@@ -2749,12 +2852,16 @@
+@@ -2749,12 +2872,16 @@
  			mci_writel(host, RINTSTS, SDMMC_INT_RXDR);
  			if (host->dir_status == MMC_DATA_READ && host->sg)
  				dw_mci_read_data_pio(host, false);
@@ -204,7 +249,7 @@ data; bail out instead. Neither turned out to be this storm.
  		}
  
  		if (pending & SDMMC_INT_CMD_DONE) {
-@@ -2783,6 +2890,18 @@
+@@ -2783,6 +2910,18 @@
  	if (host->use_dma != TRANS_MODE_IDMAC)
  		return IRQ_HANDLED;
  
@@ -223,7 +268,7 @@ data; bail out instead. Neither turned out to be this storm.
  	/* Handle IDMA interrupts */
  	if (host->dma_64bit_address == 1) {
  		pending = mci_readl(host, IDSTS64);
-@@ -2793,6 +2912,12 @@
+@@ -2793,6 +2932,12 @@
  			if (!test_bit(EVENT_DATA_ERROR, &host->pending_events))
  				host->dma_ops->complete((void *)host);
  		}
@@ -236,7 +281,7 @@ data; bail out instead. Neither turned out to be this storm.
  	} else {
  		pending = mci_readl(host, IDSTS);
  		if (pending & (SDMMC_IDMAC_INT_TI | SDMMC_IDMAC_INT_RI)) {
-@@ -2802,6 +2927,12 @@
+@@ -2802,6 +2947,12 @@
  			if (!test_bit(EVENT_DATA_ERROR, &host->pending_events))
  				host->dma_ops->complete((void *)host);
  		}
