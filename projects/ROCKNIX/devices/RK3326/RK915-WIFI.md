@@ -106,6 +106,39 @@ module reload. Under sustained load the fault re-triggers and the driver simply
 recovers again, with the backoff visible in the log (1.7 s → 2.0 → 2.9 → 3.6 →
 6.4 → 8.7 → 12.2 → 15.9 s).
 
+### The TX-spin hard hang
+
+**Fixed separately, in the kernel:**
+`patches/linux/036-dw_mmc-dont-spin-on-a-dead-bus.patch`.
+
+There is a second, harder failure: instead of the driver noticing the fault and
+recovering, `rk915_tx` wedges *inside* the SDIO write and never returns, so
+`rk915_signal_io_error()` is never called and the recovery above never runs.
+
+```
+CPU: 0 UID: 0 PID: 491 Comm: rk915_tx
+pc : dw_mci_start_command+0x58/0x120
+x19: 00000000ffffffff
+  sdio_memcpy_toio -> sdio_send_data [rk915] -> rk915_data_write
+  -> rpu_send_cmd_datas -> tx_thread [rk915]
+```
+
+`dw_mci_wait_while_busy()` polls `SDMMC_STATUS` with
+`readl_poll_timeout_atomic()` for up to 500 ms before every data command — no
+sleeping, `host->lock` held, interrupts disabled. When the chip falls off the bus
+the register reads all-ones (`x19`), so `SDMMC_STATUS_BUSY` is permanently set and
+every command burns the full 500 ms. The CPU stops servicing interrupts entirely:
+the display stalls waiting for vblank, the network dies, the joypad poll stops,
+and printk itself stops coming out. Only a power cycle recovers it.
+
+An all-ones read is not a valid status — it means the host is not answering.
+Break out of the poll and let the command time out normally so the error reaches
+the driver and the recovery path can do its job.
+
+Note this is why bulk transfers over WiFi are impractical *before* the fix: a
+24 MB scp to the device managed ~1.7 KB/s, because the link faulted and recovered
+roughly every 0.3 MB.
+
 ### What is still not fixed
 
 The *underlying* fault still occurs — bulk traffic still trips

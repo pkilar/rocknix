@@ -1,0 +1,60 @@
+mmc: dw_mmc: do not spin for 500ms when the host reads back all-ones
+
+dw_mci_wait_while_busy() polls SDMMC_STATUS with readl_poll_timeout_atomic() for
+up to 500ms before every data command. The poll is atomic - no sleeping - and it
+runs with host->lock held and interrupts disabled.
+
+When the controller or card stops answering the register reads back 0xffffffff,
+so SDMMC_STATUS_BUSY is permanently set and every command burns the full 500ms.
+A driver that retries then pins the CPU indefinitely. Observed on a Gusgu H7
+(RK3326) when the RK915 SDIO wifi chip drops off the bus under load:
+
+    rcu: INFO: rcu_sched self-detected stall on CPU
+    CPU: 0 UID: 0 PID: 491 Comm: rk915_tx
+    pc : dw_mci_start_command+0x58/0x120
+    x19: 00000000ffffffff
+    Call trace:
+     dw_mci_start_command+0x58/0x120 (P)
+     ...
+     sdio_memcpy_toio+0x20/0x28
+     sdio_send_data+0x24/0x2c [rk915]
+     tx_thread+0x24c/0x2c0 [rk915]
+
+x19 is the status readback. Interrupts stop being serviced on that CPU, so the
+display stalls waiting for vblank, the network dies, and the machine wedges hard
+enough that printk stops coming out - only a power cycle recovers it. The wifi
+driver never gets an error back either, so its own firmware error recovery is
+never entered.
+
+An all-ones read is not a valid status; it means the host is not there. Break out
+of the poll and let the command time out normally so the error propagates.
+
+--- a/drivers/mmc/host/dw_mmc.c	2026-08-27 14:58:25.299267010 -0400
++++ b/drivers/mmc/host/dw_mmc.c	2026-08-27 14:58:25.300177951 -0400
+@@ -213,11 +213,26 @@
+ 	 */
+ 	if ((cmd_flags & SDMMC_CMD_PRV_DAT_WAIT) &&
+ 	    !(cmd_flags & SDMMC_CMD_VOLT_SWITCH)) {
++		/*
++		 * An all-ones read means the controller is not answering at all
++		 * - unclocked, powered down, or the card has fallen off the bus
++		 * - it does not mean "busy". Treating it as busy makes this
++		 * atomic poll burn its full 500ms with host->lock held and
++		 * interrupts disabled, and a caller that keeps retrying then
++		 * pins the CPU: interrupts stop being serviced, RCU stalls, and
++		 * the machine wedges hard enough that printk stops coming out.
++		 * Break out instead and let the command time out normally, so
++		 * the error reaches the driver and its recovery path can run.
++		 */
+ 		if (readl_poll_timeout_atomic(host->regs + SDMMC_STATUS,
+ 					      status,
++					      status == ~0U ||
+ 					      !(status & SDMMC_STATUS_BUSY),
+ 					      10, 500 * USEC_PER_MSEC))
+ 			dev_err(host->dev, "Busy; trying anyway\n");
++		else if (status == ~0U)
++			dev_err_ratelimited(host->dev,
++					    "host not responding (status=~0)\n");
+ 	}
+ }
+ 
