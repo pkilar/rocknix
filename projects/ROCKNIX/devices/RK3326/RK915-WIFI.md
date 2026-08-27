@@ -125,15 +125,25 @@ result should not be read as the patch working.
 `projects/ROCKNIX/packages/linux-drivers/rk915/system.d/rk915-recover.service`,
 installed and enabled by the rk915 package:
 
-```
-After=multi-user.target
-ExecStart=/bin/sh -c 'sleep 30; if ip route | grep -q "^default"; then ... exit 0; fi;
-                      modprobe -r rk915; sleep 3; modprobe rk915; sleep 10;
-                      systemctl restart iwd; ...'
+It waits 30 s, then reloads `rk915` and restarts `iwd` **only if the driver
+logged a fault**:
+
+```sh
+FAULTS='rk915: .*(too long error|fw error recovery|No reset complete|check downloaded fw failed|rk915_download_firmware failed)'
+dmesg | grep -qE "$FAULTS" || exit 0        # healthy - leave it alone
+modprobe -r rk915; sleep 3; modprobe rk915; sleep 10; systemctl restart iwd
 ```
 
-It is conditional: on a boot where WiFi came up correctly it logs `link OK, no
-action` and does nothing, so it costs a healthy boot nothing but the check.
+The trigger is the kernel log, **not** connectivity. An earlier version keyed on
+"no default route", which is wrong: with WiFi unconfigured, out of range, or
+simply unused there is no route and no fault, so it reloaded the driver on every
+boot — churning `iwd` while the user was trying to configure WiFi, and renaming
+`wlan0` to `wlan1` where the UI can see it.
+
+`rx_thread: error datalen: 0` is deliberately excluded from the trigger: it is
+also seen once on a healthy interface bring-up, so it is not decisive alone.
+`RPUWIFI-UMAC: No reset complete after 900 ticks` **is** included — it is the
+same race failing earlier, during chip reset.
 
 Validation, three consecutive boots:
 

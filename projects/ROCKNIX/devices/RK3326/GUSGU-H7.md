@@ -345,11 +345,20 @@ back as `0xF0F0____`, so `rx_next_len = mac_hdr->length >> 16` is garbage and th
 bounds check kills the chip. Management frames always worked; the failure needs
 data traffic. Time-to-failure was load-dependent (4.1 s, 13.2 s, 29.4 s).
 
+The first-load failure has more than one face; `RPUWIFI-UMAC: No reset complete
+after 900 ticks` is the same race showing up earlier, during chip reset.
+
 Once the system is idle the driver is stable, so the fix is to reload it after
 boot rather than to patch it. `system.d/rk915-recover.service`, installed and
-enabled by the rk915 package, waits 30 s and — **only if there is no default
-route** — reloads `rk915` and restarts `iwd`. A healthy boot pays nothing but the
-check. Validated over three consecutive boots: all three ended with working
+enabled by the rk915 package, waits 30 s and — **only if the driver actually
+logged a fault** — reloads `rk915` and restarts `iwd`. A healthy boot pays
+nothing but the check.
+
+The trigger is deliberately the kernel log, not connectivity. Keying on "no
+default route" is wrong: with WiFi unconfigured, out of range, or simply unused
+there is no route and no fault, and reloading would churn the driver and restart
+`iwd` underneath the user — including renaming `wlan0` to `wlan1`, which is
+visible in the UI. Validated over three consecutive boots: all three ended with working
 networking, two after the unit logged `recovered`. Post-reload soaks: 300/300,
 396/400 and — on a boot the unit recovered by itself — **400/400 pings, 0% loss,
 3.19 MB RX**, zero driver faults throughout.

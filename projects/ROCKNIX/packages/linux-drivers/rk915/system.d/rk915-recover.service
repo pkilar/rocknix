@@ -6,7 +6,7 @@ Wants=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'sleep 30; if ip route | grep -q "^default"; then logger -t rk915-recover "link OK, no action"; exit 0; fi; logger -t rk915-recover "no default route - reloading rk915"; modprobe -r rk915; sleep 3; modprobe rk915; sleep 10; systemctl restart iwd; sleep 20; ip route | grep -q "^default" && logger -t rk915-recover "recovered" || logger -t rk915-recover "still down"'
+ExecStart=/usr/lib/rk915/rk915-recover.sh
 
 [Install]
 WantedBy=multi-user.target

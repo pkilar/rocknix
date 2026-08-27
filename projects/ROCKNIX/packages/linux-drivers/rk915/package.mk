@@ -39,9 +39,12 @@ makeinstall_target() {
   # See GUSGU-H7.md "WiFi": the driver loses a race against boot-time load
   # roughly two boots in three and comes up with a dead link. Reloading it once
   # the system has settled is reliable, so ship a unit that does exactly that,
-  # and only when there is no default route.
+  # and only when the driver actually logged a fault.
   mkdir -p ${INSTALL}/usr/lib/systemd/system
     cp ${PKG_DIR}/system.d/rk915-recover.service ${INSTALL}/usr/lib/systemd/system
+  mkdir -p ${INSTALL}/usr/lib/rk915
+    cp ${PKG_DIR}/system.d/rk915-recover.sh ${INSTALL}/usr/lib/rk915
+    chmod +x ${INSTALL}/usr/lib/rk915/rk915-recover.sh
 }
 
 post_install() {
