@@ -4,8 +4,9 @@ Adds an `h7` subdevice to the RK3326 target for the **Gusgu H7**, an unbranded
 Rockchip RK3326 handheld that ships a vendor EmuELEC 4.7 build. Everything here was
 derived from the device's own stock DTB and verified on hardware — nothing guessed.
 
-**Status: complete.** Boots to EmulationStation; display, audio, all 17 buttons,
-volume keys and the analog stick (correct axes and signs) all verified on hardware.
+**Status:** boots to EmulationStation; display, audio, all 17 buttons, volume keys
+and the analog stick verified on hardware. WiFi (RK915) is integrated but unproven —
+see §8.
 
 ---
 
@@ -36,6 +37,9 @@ A copy of the stock DTB lives in `packages/u-boot/config/stock/` for the
 | `packages/u-boot/config/stock/…dtb` | stock DTB for the on-device wizard |
 | `projects/ROCKNIX/config.xml` → `<h7>` | registers the subdevice |
 | `projects/ROCKNIX/bootloader/mkimage` | per-subdevice extlinux hook (2 lines + comment) |
+| `patches/linux/035-rk915-sdio-quirks.patch` | MMC quirks for the RK915 WiFi chip (§8) |
+| `projects/ROCKNIX/packages/linux-drivers/rk915/` | RK915 driver + firmware package |
+| `devices/RK3326/options` | `ADDITIONAL_DRIVERS += rk915` |
 
 Nothing shared is overwritten — the `-a` and `-b` images build exactly as they do
 upstream. `mkimage_extlinux()` now prefers `extlinux/extlinux.conf.sub-${SUBDEVICE}`
@@ -224,7 +228,65 @@ devices with 1 stick too", supplying all 17 `linux,code` values and a stable joy
 GUID. It cannot be included here because it declares the `joypad:` label that eeclone
 already defines, but it is the reference for the button-name set.
 
-## 8. Build and flash
+## 8. WiFi — Rockchip RK915
+
+The H7 has a **Rockchip RK915** SDIO WiFi chip (`wifi_chip_type = "rk915"` in the
+stock DT). ROCKNIX ships no driver for it, and eeclone's `&sdio` is configured as an
+SD card slot, so out of the box `mmc2` initialises, nothing enumerates and there is
+no `wlan0`.
+
+Three pieces are needed, all present in this tree:
+
+| Piece | Where |
+|---|---|
+| MMC core/host quirks | `patches/linux/035-rk915-sdio-quirks.patch` |
+| Driver + firmware | `packages/linux-drivers/rk915/`, pulled in via `ADDITIONAL_DRIVERS` |
+| SDIO reconfiguration | `&sdio` / `sdio_pwrseq` / `&pinctrl` in the DTS |
+
+### The driver
+
+An out-of-tree mainline port by Danil Zagoskin (a ROCKNIX developer):
+<https://github.com/stolen/rk915>, itself a port of the vendor BSP driver.
+
+The firmware blobs it ships (`rk915_fw.bin`, `rk915_patch.bin`) are **byte-identical**
+to those in the stock EmuELEC image (md5 `a0e5ed75…` / `6c1f8ec6…`), confirming it
+targets this exact chip revision.
+
+⚠️ **Upstream describes the driver as "not usable yet"**, with two known defects:
+the chip disconnects soon after association, and unloading the module can stall the
+system. That work stopped in July 2025. Everything here is the *integration*; whether
+the link is actually stable is unverified.
+
+### The kernel quirks
+
+The RK915 is not a conforming SDIO card. `035-rk915-sdio-quirks.patch` adds
+`MMC_CAP2_WIFI_RK912` (bit 29, free in 7.1.2), opted into per controller with the
+`supports-rk912` property — the name the vendor device trees already use — so no
+other device is affected. It:
+
+- tolerates a CIS shorter than the spec minimum (`sdio_cis.c`)
+- skips re-powering the card on resume (`sdio.c`)
+- forces `PRV_DAT_WAIT` on `SD_IO_RW_DIRECT` and disables low-power clock gating
+  (`dw_mmc.c`)
+
+Ported from the upstream 6.12.29 patch; two hunks needed adjusting because dw_mmc
+dropped multi-slot support since then, so `slot->flags` / `slot->mmc` became
+`host->flags` / `host->mmc`. Verified to apply cleanly to pristine 7.1.2.
+
+### The device tree
+
+eeclone's `&sdio` sets `cd-gpios = <&gpio0 RK_PA2>`. On the H7 that pin is
+`WIFI,poweren_gpio` — so the DT holds the power-enable line as a card-detect input
+and the chip never powers up. The DTS deletes the SD-card properties, adds an
+`mmc-pwrseq-simple` driving `gpio0 RK_PA2`, and sets the values from the stock tree
+(50 MHz, `cap-sd-highspeed`, `keep-power-in-suspend`, `supports-rk912`).
+
+Host-wake is `gpio0 RK_PA1`, from the stock `WIFI,host_wake_irq`. The upstream
+driver's example dtsi uses `RK_PA5` — that is its author's board, not this one.
+
+---
+
+## 9. Build and flash
 
 ```bash
 make docker-RK3326        # host GCC 16 vs required GCC 12 — use the container
@@ -245,7 +307,7 @@ repos at all). `make docker-RK3326` avoids the whole issue.
 
 ---
 
-## 9. Iterating without pulling the SD card
+## 10. Iterating without pulling the SD card
 
 `systemd.debug_shell=ttyS2` is in the `APPEND` line, so `debug-shell.service` gives an
 unauthenticated root shell on serial at 1500000. `/flash` is the SD's boot partition and
@@ -272,7 +334,7 @@ battery, so keep it on the charger for U-Boot work and off it for reboots.
 
 ---
 
-## 10. Re-deriving the panel
+## 11. Re-deriving the panel
 
 The panel description came from the stock DTB via `generic-dsi`'s importer, not by
 hand:
