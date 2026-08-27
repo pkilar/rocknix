@@ -153,11 +153,33 @@ Validation, three consecutive boots:
 | 2 | yes | `recovered` |
 | 3 | yes | `recovered` |
 
-Kernel cmdline is unchanged from the configuration these runs were validated
-under (`rk915.patch_features=12 rk915.debug_mask=0x150000` in
-`extlinux.conf.sub-h7`). Neither parameter is proven to help; they were left in
-place because that is the exact combination the 3/3 validation ran against, and
-changing them would have made that evidence stale.
+### Do not put `debug_mask` on the cmdline
+
+`rk915.patch_features=12 rk915.debug_mask=0x150000` were initially left on the
+cmdline because that was the combination the 3/3 validation ran against. That was
+a mistake, and it bit on the first boot where WiFi carried real traffic.
+
+The HALIO site logs **once per packet** in every chained RX burst. At 1.5 Mbaud a
+~40-character line is ~267 µs of blocking console write, so a busy link saturates
+the console: vblank handling misses its deadline
+(`[CRTC:39:crtc-0] vblank wait timed out` in `drm_atomic_helper_wait_for_vblanks`),
+RCU stalls, `systemd-journal` spins eating the flood, load average hits 6.7 and
+the device freezes. Every soak before that point was pings at 1/s, a rate that
+never exercises the logging path — the parameter was validated under a traffic
+profile that could not reveal its cost.
+
+Both parameters are now removed. Re-measured without them, at 10× the packet rate:
+
+| Metric | Result |
+|---|---|
+| ping | 1991/2000, 0.45% loss, 3.24 MB RX |
+| vblank timeouts / RCU stalls | 0 / 0 |
+| driver faults | 0 |
+| `rk915:` lines in dmesg | 3 (version + firmware) |
+| load average | 0.71 |
+
+WiFi associates and holds a lease with `debug_mask` unset, which is further
+evidence the parameter never did anything for the RX race.
 
 ## Honest status
 

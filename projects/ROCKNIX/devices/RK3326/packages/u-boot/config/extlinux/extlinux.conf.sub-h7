@@ -1,4 +1,4 @@
 LABEL ROCKNIX
   LINUX /KERNEL
   FDT /rk3326-gusgu-h7.dtb
-  APPEND boot=LABEL=ROCKNIX disk=LABEL=STORAGE console=tty0 console=ttyS2,1500000 systemd.debug_shell=ttyS2 rk915.patch_features=12 rk915.debug_mask=0x150000
+  APPEND boot=LABEL=ROCKNIX disk=LABEL=STORAGE console=tty0 console=ttyS2,1500000 systemd.debug_shell=ttyS2

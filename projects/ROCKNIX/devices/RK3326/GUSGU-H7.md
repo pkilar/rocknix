@@ -379,9 +379,16 @@ its incidental delays. **That did not replicate** — retested, both `0x40000` a
 fault. The delay patch built on it is disproven and is not shipped; elapsed time
 alone is not what distinguishes the printk from a busy-wait.
 
-`rk915.patch_features=12 rk915.debug_mask=0x150000` remain on the cmdline only
-because that is the exact combination the 3/3 validation ran against. Neither is
-proven to help.
+`rk915.patch_features` and `rk915.debug_mask` have been **removed** from the
+cmdline. Neither was ever shown to help, and `debug_mask` is actively harmful
+under load: the HALIO site logs **once per packet** in every chained RX burst, so
+at 1.5 Mbaud a busy link spends ~267 µs of blocking console write per packet.
+That starves vblank handling (`[CRTC:39:crtc-0] vblank wait timed out`), stalls
+RCU, pins `systemd-journal` eating the flood, and freezes the device. It went
+unnoticed because every soak up to that point was pings at 1/s, which never
+exercises the logging path. With the parameters gone, a 10 pps / 1400-byte soak
+moved 3.24 MB with 0 vblank timeouts, 0 RCU stalls, 0 driver faults and load
+average 0.71.
 
 Full account, including the measurements and the dead ends: **`RK915-WIFI.md`**.
 
