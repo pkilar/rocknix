@@ -1,36 +1,36 @@
-mmc: dw_mmc: handle an all-ones register read as "host gone", not as work
+mmc: dw_mmc: acknowledge abnormal IDMAC interrupts, and ignore all-ones reads
 
-Two places treat a 0xffffffff read from an absent controller as meaningful:
+dw_mci_interrupt() acknowledges only TI, RI and NI from the IDMAC status
+register. FBE (fatal bus error), DU (descriptor unavailable), CES (card error
+summary) and the AI abnormal summary are latched by the hardware and never
+cleared. If a card drops off the bus mid-DMA the IDMAC raises them, nothing
+acknowledges them, and because the line is level triggered the handler is
+re-entered immediately, forever.
 
-1. dw_mci_wait_while_busy() polls SDMMC_STATUS with readl_poll_timeout_atomic()
-   for up to 500ms before every data command - atomic, host->lock held, irqs
-   disabled. All-ones means SDMMC_STATUS_BUSY is permanently set, so every
-   command burns the full 500ms and a retrying driver pins the CPU.
+Measured on a Gusgu H7 (RK3326) with the RK915 SDIO wifi chip, using per-irq
+tracing to the console while the fault was reproduced with concurrent HTTP:
 
-2. dw_mci_interrupt() reads MINTSTS and, if non-zero, services it. All-ones
-   means it "handles" all 32 bits, the writes to RINTSTS go nowhere, and since
-   the line is level triggered it is re-entered immediately.
+    IRQTRACE 344 dwmci: 56:164736147  vop=11531 adc=24734 ser=418 gpio=10946
+    IRQTRACE 345 dwmci: 56:165433415  vop=11531 adc=24734 ser=418 gpio=10946
 
-(2) is the more damaging: measured at ~690,000 interrupts/second on a Gusgu H7
-(RK3326) when the RK915 SDIO wifi chip drops off the bus under concurrent load.
-Per-irq tracing during the hang:
+irq 56 is mmc@ff380000: ~684,000 interrupts per second, while every other
+interrupt on that CPU is frozen at a fixed count. All device interrupts on this
+board are affine to CPU0, so the VOP stops (drm vblank timeouts), the SARADC
+stops (rocknix-joypad error spam), and the network dies - the machine appears to
+hang and needs a power cycle. RCU stalls too, reporting the CPU in
+default_idle_call() as if idle; it is not, it is being re-interrupted between
+every WFI, which sent this investigation down a long cpuidle dead end.
+cpuidle.off=1 and nohz=off both changed nothing, as expected in hindsight.
 
-    IRQTRACE 32 timer=57321/62722/55965/64999 dwmci: 54:3363849 vop=6888 adc=13510
-    IRQTRACE 33 timer=57627/63111/56569/65405 dwmci: 54:4053907 vop=6888 adc=13510
+Acknowledge the abnormal bits so the line can drop.
 
-irq 54 is mmc@ff380000 (the sdio host). Every other CPU0-affine interrupt is
-frozen: the VOP stops (drm vblank timeouts), the SARADC stops (joypad error
-spam), the network dies. RCU then stalls because the CPU is permanently in irq
-context entered from idle, so it never reaches an extended quiescent state -
-the stall report shows it in default_idle_call() looking idle, which is
-misleading; it is being re-interrupted between every WFI.
+Also included: two places treat an all-ones register read from an absent
+controller as meaningful. dw_mci_wait_while_busy() spins the full 500ms in an
+atomic poll with host->lock held, and dw_mci_interrupt() would service all 32
+bits of MINTSTS. Neither is data; bail out instead.
 
-An all-ones read is not data. Bail out in both places: let the command time out
-normally so the error reaches the driver, and return IRQ_NONE so the spurious
-irq machinery can shut the line down.
-
---- a/drivers/mmc/host/dw_mmc.c	2026-08-27 16:48:54.029757320 -0400
-+++ b/drivers/mmc/host/dw_mmc.c	2026-08-27 16:48:54.030904680 -0400
+--- a/drivers/mmc/host/dw_mmc.c	2026-08-27 17:14:41.714106315 -0400
++++ b/drivers/mmc/host/dw_mmc.c	2026-08-27 17:14:41.715000210 -0400
 @@ -213,11 +213,26 @@
  	 */
  	if ((cmd_flags & SDMMC_CMD_PRV_DAT_WAIT) &&
@@ -83,3 +83,48 @@ irq machinery can shut the line down.
  	if (pending) {
  		/* Check volt switch first, since it can look like an error */
  		if ((host->state == STATE_SENDING_CMD11) &&
+@@ -2783,6 +2816,18 @@
+ 	if (host->use_dma != TRANS_MODE_IDMAC)
+ 		return IRQ_HANDLED;
+ 
++	/*
++	 * Abnormal IDMAC conditions - fatal bus error, descriptor unavailable,
++	 * card error summary - are latched but were never acknowledged here,
++	 * only TI/RI/NI were. If the card drops off the bus mid-DMA the IDMAC
++	 * raises FBE/DU/CES (and the AI summary), nothing clears them, and the
++	 * level-triggered line stays asserted: the handler is re-entered
++	 * forever. Measured at ~684,000 interrupts/second on an RK3326, which
++	 * starves every other interrupt on that CPU and hangs the machine.
++	 */
++#define DW_MCI_IDMAC_ABNORMAL	(SDMMC_IDMAC_INT_FBE | SDMMC_IDMAC_INT_DU | \
++				 SDMMC_IDMAC_INT_CES | SDMMC_IDMAC_INT_AI)
++
+ 	/* Handle IDMA interrupts */
+ 	if (host->dma_64bit_address == 1) {
+ 		pending = mci_readl(host, IDSTS64);
+@@ -2793,6 +2838,12 @@
+ 			if (!test_bit(EVENT_DATA_ERROR, &host->pending_events))
+ 				host->dma_ops->complete((void *)host);
+ 		}
++		if (pending & DW_MCI_IDMAC_ABNORMAL) {
++			mci_writel(host, IDSTS64, DW_MCI_IDMAC_ABNORMAL);
++			dev_err_ratelimited(host->dev,
++					    "IDMAC abnormal, IDSTS64=%08x\n",
++					    pending);
++		}
+ 	} else {
+ 		pending = mci_readl(host, IDSTS);
+ 		if (pending & (SDMMC_IDMAC_INT_TI | SDMMC_IDMAC_INT_RI)) {
+@@ -2802,6 +2853,12 @@
+ 			if (!test_bit(EVENT_DATA_ERROR, &host->pending_events))
+ 				host->dma_ops->complete((void *)host);
+ 		}
++		if (pending & DW_MCI_IDMAC_ABNORMAL) {
++			mci_writel(host, IDSTS, DW_MCI_IDMAC_ABNORMAL);
++			dev_err_ratelimited(host->dev,
++					    "IDMAC abnormal, IDSTS=%08x\n",
++					    pending);
++		}
+ 	}
+ 
+ 	return IRQ_HANDLED;
