@@ -5,8 +5,8 @@ Rockchip RK3326 handheld that ships a vendor EmuELEC 4.7 build. Everything here 
 derived from the device's own stock DTB and verified on hardware — nothing guessed.
 
 **Status:** boots to EmulationStation; display, audio, all 17 buttons, volume keys
-and the analog stick verified on hardware. WiFi (RK915) associates; a sleep
-regression in the driver port is patched but not yet re-tested — see §8.
+and the analog stick verified on hardware. **WiFi works** — but only via a timing
+workaround, not a real fix; see §8.
 
 ---
 
@@ -326,6 +326,52 @@ the `module_param` that could have turned sleep off:
 So the chip sleeps during the first idle moment after association and never
 wakes. `patches/rk915-0001-keep-lmac-awake.patch` defaults it to 1 and restores
 the parameter. Costs idle power; the proper fix is to restore the wake path.
+
+
+### WiFi works, but on a timing workaround
+
+The link is up and stable: 600 pings at 1400 bytes over 60 s, **0% loss**, 2.8 MB
+RX / 1.1 MB TX, zero driver errors. DHCP lease acquired.
+
+Getting there required `rk915.debug_mask=0x150000` on the kernel cmdline. **That is
+not a fix.** Enabling the driver's own HALIO/SDIO/RECOVERY logging perturbs timing
+in the SDIO access path and the fault stops happening — a textbook heisenbug.
+
+Two hypotheses were tested on hardware and **eliminated**:
+
+| Tried | Result |
+|---|---|
+| `lpw_no_sleep=1` (LMAC sleep, patched default) | verified active via `modinfo`; failure unchanged |
+| `patch_features=12` (the BSP's firmware feature bits) | verified active via cmdline; failure unchanged |
+
+Both are kept — 12 matches what the vendor ships, and neither does harm — but
+neither is what made it work.
+
+The mechanism is visible in the BSP diff. The vendor logs **unconditionally** in
+these paths:
+
+```c
+BSP:   RPU_INFO_SDIO("%s: change clock to %d\n", ...);
+port:  rk915_dbg(RK915_DBG_SDIO, "%s: change clock to %d\n", ...);
+```
+
+The port made every such call conditional on `debug_mask`, which with the default
+of 0 removes the delays the vendor's code always had. So there is a latent race in
+the SDIO path that the vendor's logging masked by accident, and the port exposed.
+
+⚠️ **This workaround likely depends on `console=ttyS2` being present**, since the
+delay comes from printk blocking on a 1.5 Mbaud serial console. Removing the serial
+console may bring the fault back.
+
+Symptoms when it fails: `rk915_serias_read: length(61680) too long error` — 0xF0F0
+from the two CMD52 reads in `rk915_read_data_len()` — then failed firmware recovery
+(`30550/48056 bytes differ`) and mac80211 teardown. Time-to-failure varied (4.1 s,
+4.2 s, 13.2 s), so it is load-dependent, not a timer. Management frames always
+worked; only the data path fails.
+
+**To find the real fix:** bisect `debug_mask` to the single bit that keeps it
+stable (`0x40000` HALIO, `0x10000` SDIO, `0x100000` RECOVERY), then replace that
+path's incidental logging delay with an explicit one.
 
 ### The device tree
 
