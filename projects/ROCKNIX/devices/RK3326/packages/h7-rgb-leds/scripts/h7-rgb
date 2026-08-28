@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Drive the Gusgu H7's WS2812 RGB LEDs via /dev/spidev1.0.
+
+Protocol recovered by capturing the stock firmware's own /usr/bin/ws2812
+through an LD_PRELOAD ioctl shim. It sends a 72-byte frame at ~94 Hz:
+
+  one SPI byte per WS2812 bit, at the 8 MHz device default (125 ns/bit)
+      0xc0 = 11000000 -> 250 ns high  -> a 0
+      0xfc = 11111100 -> 750 ns high  -> a 1
+  three LEDs, three bytes each, wire order GRB
+  no latch bytes - the idle gap between frames is the reset
+
+Usage:  h7-rgb <r> <g> <b>     set all three LEDs (0-255 each)
+        h7-rgb off
+        h7-rgb demo            walk red/green/blue across the three
+        h7-rgb boot            apply CONF if present, else a dim white
+"""
+import fcntl, struct, sys, time
+
+DEV, NLED = "/dev/spidev1.0", 3
+CONF = "/storage/.config/h7-rgb.conf"   # one line: "R G B"
+ZERO, ONE = 0xC0, 0xFC
+SPI_IOC_WR_MODE = 0x40016B01
+SPI_IOC_WR_BITS_PER_WORD = 0x40016B03
+SPI_IOC_WR_MAX_SPEED_HZ = 0x40046B04
+SPEED = 8_000_000
+
+def encode(pixels):
+    out = bytearray()
+    for r, g, b in pixels:
+        for byte in (g, r, b):                       # GRB on the wire
+            for i in range(7, -1, -1):               # MSB first
+                out.append(ONE if (byte >> i) & 1 else ZERO)
+    return bytes(out)
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__); return 1
+    fd = open(DEV, "wb", buffering=0)
+    fcntl.ioctl(fd, SPI_IOC_WR_MODE, struct.pack("B", 0))
+    fcntl.ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, struct.pack("B", 8))
+    fcntl.ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, struct.pack("I", SPEED))
+
+    def show(px, hold=0.0):
+        fd.write(encode(px)); fd.flush()
+        if hold: time.sleep(hold)
+
+    if sys.argv[1] == "boot":
+        rgb = (32, 32, 32)
+        try:
+            with open(CONF) as f:
+                parts = f.read().split()
+                if len(parts) >= 3:
+                    rgb = tuple(max(0, min(255, int(v))) for v in parts[:3])
+        except (OSError, ValueError):
+            pass                                  # no config, or garbage in it
+        show([rgb] * NLED)
+    elif sys.argv[1] == "off":
+        show([(0, 0, 0)] * NLED)
+    elif sys.argv[1] == "demo":
+        for colour in ((255, 0, 0), (0, 255, 0), (0, 0, 255)):
+            for i in range(NLED):
+                px = [(0, 0, 0)] * NLED
+                px[i] = colour
+                show(px, 0.4)
+        show([(0, 0, 0)] * NLED)
+    else:
+        r, g, b = (int(x) for x in sys.argv[1:4])
+        show([(r, g, b)] * NLED)
+    return 0
+
+sys.exit(main())

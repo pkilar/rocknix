@@ -1,0 +1,14 @@
+[Unit]
+Description=Gusgu H7 RGB LEDs
+After=multi-user.target
+ConditionPathExists=/dev/spidev1.0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Applies /storage/.config/h7-rgb.conf if present, else a dim white.
+ExecStart=/usr/bin/h7-rgb boot
+ExecStop=/usr/bin/h7-rgb off
+
+[Install]
+WantedBy=multi-user.target
