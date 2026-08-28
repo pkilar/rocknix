@@ -430,6 +430,26 @@
  * WIFI,host_wake_irq (the upstream driver's example dtsi uses RK_PA5, which is
  * that author's board, not this one).
  */
+/ {
+	/*
+	 * The ported rk915 driver falls back to eth_random_addr() when the DT
+	 * carries no MAC, so the interface came up with a new address - and a
+	 * new DHCP lease - on every module load. The BSP avoided that by
+	 * calling rockchip_wifi_mac_addr(), which reads the factory MAC out of
+	 * Rockchip vendor storage; there is no mainline equivalent.
+	 *
+	 * The vendor U-Boot already reads that same vendor storage and exports
+	 * it as ethaddr (and the derived P2P address as eth1addr). Point
+	 * ethernet0 at the wifi node and U-Boot's fdt_fixup_ethernet() writes
+	 * ethaddr into it as mac-address, which of_get_mac_address() then
+	 * finds. That keeps the address per-device instead of baking one
+	 * handheld's MAC into a DTS everyone shares.
+	 */
+	aliases {
+		ethernet0 = &rk915_wifi;
+	};
+};
+
 &sdio {
 	/delete-property/ cd-gpios;
 	/delete-property/ card-detect-delay;
@@ -449,31 +469,9 @@
 	non-removable;
 	status = "okay";
 
-	wifi@1 {
+	rk915_wifi: wifi@1 {
 		compatible = "rockchip,rk915";
 		reg = <1>;
-
-		/*
-		 * The factory wifi MAC, read out of this unit's Rockchip vendor
-		 * storage on the eMMC (item id 3 at sector 7296 + 1024):
-		 *
-		 *   1e 28 78 e8 94 15   22 28 78 e8 94 15
-		 *
-		 * the second being the P2P address the BSP derives as
-		 * mac[0] |= 0x02; mac[0] += 1 << 2.
-		 *
-		 * The BSP driver fetches this via rockchip_wifi_mac_addr(),
-		 * which is a Rockchip-only API with no mainline equivalent, so
-		 * the ported driver falls back to eth_random_addr() and the
-		 * interface comes up with a different MAC - and a different DHCP
-		 * lease - on every load. of_get_mac_address() picks this up
-		 * instead.
-		 *
-		 * NOTE: this value belongs to one specific handheld. Anyone
-		 * reusing this DTS on another unit should read their own out of
-		 * vendor storage, or drop the property and accept a random MAC.
-		 */
-		local-mac-address = [1e 28 78 e8 94 15];
 		interrupt-names = "host-wake";
 		interrupt-parent = <&gpio0>;
 		interrupts = <RK_PA1 IRQ_TYPE_LEVEL_HIGH>;
