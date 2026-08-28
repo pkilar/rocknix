@@ -489,13 +489,37 @@ logging `ioctl(SPI_IOC_MESSAGE)` rather than guessed:
 | colour order | GRB |
 | latch | none in-frame; the idle gap at ~94 Hz is the reset |
 
-`h7-rgb` reproduces that frame byte-for-byte. Usage:
+`h7-rgb` reproduces that frame byte-for-byte.
+
+**The RGB button** on the case cycles the modes, as it did on stock. It is
+`BTN_MODE` (316) on the gamepad - captured live from `/dev/input/event*`, and
+matching the DTS, where `gpio3 RK_PD2` labelled "GPIO FN" maps to `BTN_MODE`.
+The stock firmware read the same physical button as `KEY_FN` and ran
+`ws2812 "$mode" &` on each press.
+
+`h7-rgb daemon` renders effects and follows that button through the stock
+firmware's own 17 modes, in its order, persisting the choice to
+`/storage/.config/h7-rgb.conf`:
+
+```
+Red  Red_Green  Green  Green_Blue  Blue  Blue_Red  Red_Green_Blue
+Breathing_{Red,Green,Blue,Blue_Red,Green_Blue,Red_Green,Red_Green_Blue}
+Breathing  Scrolling  OFF
+```
+
+It reads the gamepad **without `EVIOCGRAB`**, so the UI still sees the button -
+grabbing it would steal a key the frontend uses. Breathing is a raised cosine
+floored at 15% so the ring never goes fully dark mid-pulse; scrolling rotates
+the colours around the three pixels.
 
 ```bash
 h7-rgb 255 0 0      # all three red
 h7-rgb off
-h7-rgb demo         # walk each LED
-h7-rgb boot         # apply /storage/.config/h7-rgb.conf, else dim white
+h7-rgb mode Scrolling
+h7-rgb next         # advance one mode
+h7-rgb list
+h7-rgb boot         # re-apply the saved mode
+h7-rgb daemon       # what the service runs
 ```
 
 ⚠️ If a colour change appears to do nothing, check nothing else is driving the
