@@ -452,6 +452,28 @@
 	wifi@1 {
 		compatible = "rockchip,rk915";
 		reg = <1>;
+
+		/*
+		 * The factory wifi MAC, read out of this unit's Rockchip vendor
+		 * storage on the eMMC (item id 3 at sector 7296 + 1024):
+		 *
+		 *   1e 28 78 e8 94 15   22 28 78 e8 94 15
+		 *
+		 * the second being the P2P address the BSP derives as
+		 * mac[0] |= 0x02; mac[0] += 1 << 2.
+		 *
+		 * The BSP driver fetches this via rockchip_wifi_mac_addr(),
+		 * which is a Rockchip-only API with no mainline equivalent, so
+		 * the ported driver falls back to eth_random_addr() and the
+		 * interface comes up with a different MAC - and a different DHCP
+		 * lease - on every load. of_get_mac_address() picks this up
+		 * instead.
+		 *
+		 * NOTE: this value belongs to one specific handheld. Anyone
+		 * reusing this DTS on another unit should read their own out of
+		 * vendor storage, or drop the property and accept a random MAC.
+		 */
+		local-mac-address = [1e 28 78 e8 94 15];
 		interrupt-names = "host-wake";
 		interrupt-parent = <&gpio0>;
 		interrupts = <RK_PA1 IRQ_TYPE_LEVEL_HIGH>;
