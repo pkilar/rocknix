@@ -265,9 +265,13 @@ revision.
 
 ⚠️ **PR #2 is a draft.** Its author wrote *"I may not get to look at this again for
 awhile"*, and its README still carries the original status — chip disconnects soon
-after association, unloading may stall the system. Several of its commits look
-aimed squarely at those defects, but nothing here is verified on hardware. This
-is the integration; link stability is unproven.
+after association, unloading may stall the system.
+
+Both of those defects are **real and reproduced here, and both are now fixed** —
+the first by keeping the LMAC awake, the second by arming the dw_mmc data timeout
+for writes. Three further bugs were found on the way. All five fixes, plus a
+write-up of one fault that remains unsolved, are filed back upstream as
+<https://github.com/sunshineinabox/rk915/pull/1>.
 
 ### The kernel quirks
 
@@ -315,27 +319,44 @@ trigger_wakeup   check_and_wakeup_rpu_nonblocking   get_rpu_sleep_status
 trigger_timed_sleep
 ```
 
-The BSP wakes the chip before touching it over SDIO (`hal.c:809`). The port
-dropped that path — but kept telling the firmware it may sleep, and also dropped
-the `module_param` that could have turned sleep off:
+Those deletions look decisive, but they are not: in the BSP all four are **empty
+stubs** (`trigger_wakeup()` is `{ return; }`), `RPU_SLEEP_ENABLE` is defined so
+they compile and do nothing, and the one site in `hal.c` that would wake the chip
+before a transfer sits inside `#if 0//def RPU_SLEEP_ENABLE` there too. There is no
+host-side wake path in either tree.
+
+What the port actually lost is the ability to stop the chip sleeping in the first
+place — it kept telling the firmware it may sleep, and dropped the `module_param`
+that could have turned that off:
 
 | | BSP | port |
 |---|---|---|
 | | `unsigned int lpw_no_sleep = 0;`<br>`module_param(lpw_no_sleep, int, 0);` | `unsigned int lpw_no_sleep;` |
 
-So the chip sleeps during the first idle moment after association and never
-wakes. `patches/rk915-0001-keep-lmac-awake.patch` defaults it to 1 and restores
-the parameter. Costs idle power; the proper fix is to restore the wake path.
+So the chip sleeps during the first idle moment after association and, with no
+wake path anywhere, never wakes. `patches/rk915-0001-keep-lmac-awake.patch`
+defaults it to 1 and restores the parameter. Costs idle power, and it is the only
+lever that exists for this chip — it is also what the vendor's own
+`rk915_rftest.sh` passes. The link then held for **13 h 44 m** continuously.
+
+The loss looks accidental: the BSP declared nine `module_param`s and the port
+declares two, yet the port still ships `rk915_rftest.sh`, which insmods with
+`down_fw_in_probe=1 default_phy_threshold=180 lpw_no_sleep=1` — three parameters
+the module no longer accepts.
 
 
 ### WiFi works, via a recovery unit
 
 > **WiFi works, with one known limit.** It associates, holds a lease and keeps a
-> stable MAC. Under *concurrent* traffic the chip still faults, but a fault is now
-> a self-healing blip rather than a hard hang: several dw_mmc and driver bugs that
+> stable MAC. Sustained transfer above roughly **15–29 KB/s** still faults the
+> chip — in either direction, one connection is enough — but a fault is now a
+> self-healing blip rather than a hard hang: several dw_mmc and driver bugs that
 > turned it into a machine-wide lockup are fixed, and the driver's own firmware
-> recovery now completes. Full record in **`RK915-WIFI.md`**; the outstanding
-> chip-level fault is written up for upstream in **`RK915-UPSTREAM-REPORT.md`**.
+> recovery now completes. Below that rate the link is stable indefinitely: 383 MB
+> over 13 h 44 m with zero faults, and a 24 MB `rsync --bwlimit=15` with none
+> either. Full record in **`RK915-WIFI.md`**; the outstanding chip-level fault is
+> written up in **`RK915-UPSTREAM-REPORT.md`** and filed as
+> <https://github.com/sunshineinabox/rk915/pull/1>.
 
 The driver loses a race against boot-time system load and comes up with a dead
 link roughly **two boots in three**: it associates and usually gets a DHCP lease,
@@ -451,6 +472,37 @@ The helper scripts alongside the eMMC backup automate it:
 ```
 
 `push.py` handles the `/flash` remount rw→ro and refuses to reboot on md5 mismatch.
+
+### Over WiFi, now that WiFi works
+
+Serial is fine for a DTB and hopeless for a 24 MB kernel. WiFi is usable for
+this, but **only rate-limited** — sustained transfer above ~29 KB/s faults the
+chip (see `RK915-WIFI.md`). At 15 KB/s a full kernel copies cleanly:
+
+```bash
+rsync -e "ssh" --partial --append-verify --bwlimit=15 \
+      target/…/KERNEL root@<device>:/storage/KERNEL.new
+```
+
+`--partial --append-verify` matters: if the link does fault, the driver recovers
+by itself and the next attempt resumes rather than restarting. 24 MB took ~26 min
+and completed on the first attempt.
+
+Then stage it, verify **before** overwriting the boot kernel, and keep a rollback
+until the new one has booted:
+
+```bash
+mount -o remount,rw /flash
+cp /flash/KERNEL /flash/KERNEL.prev
+cp /storage/KERNEL.new /flash/KERNEL
+md5sum /flash/KERNEL                       # must match target/KERNEL.md5
+echo "<md5>  target/KERNEL" > /flash/KERNEL.md5
+mount -o remount,ro /flash
+```
+
+Replacing only `KERNEL` is safe as long as the module ABI has not moved — a
+`dw_mmc.c` change touching no exported symbol leaves the `rk915.ko` already in
+`SYSTEM` loadable. Check `uname -r` matches if in doubt.
 
 ⚠️ **A soft `reboot` with the charger attached lands in U-Boot's charge-animation loop**
 (`type:1-1,vol:...,cur:...` / `Wfi`) rather than booting — the vendor U-Boot only
