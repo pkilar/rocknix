@@ -47,12 +47,35 @@ Not an integration fault on my side: the card node's `compatible =
 nodes, so the quirks match; `CLKENA = 0x1` confirms the clock is ungated; the bus
 runs at the stock 50 MHz / 4-bit / SD-high-speed / 3.3 V.
 
-**The port dropped the BSP's wake path.** Diffing against `docs/0001-rk915.patch`:
-`hal.c` is 883 lines here against the BSP's 1971, and the deletions include
-`trigger_wakeup()`, `check_and_wakeup_rpu_nonblocking()`, `get_rpu_sleep_status()`
-and `trigger_timed_sleep()`. The BSP wakes the chip before touching it over SDIO
-(`hal.c:809`). The port removed that path, kept telling the firmware it may
-sleep, and also dropped the module_param that could have disabled sleeping:
+**There is no host-side wake path — in either tree.** I went looking for one to
+restore, because the port's `hal.c` is 883 lines against the BSP's 1971 and the
+deletions include `trigger_wakeup()`, `check_and_wakeup_rpu_nonblocking()`,
+`get_rpu_sleep_status()` and `trigger_timed_sleep()`. But in the BSP those four
+are empty stubs:
+
+```c
+#ifdef RPU_SLEEP_ENABLE
+int check_and_wakeup_rpu_nonblocking(void) { return true; }
+static void trigger_timed_sleep(int val) { }
+static bool get_rpu_sleep_status(void) { return RPU_AWAKE; }
+static void trigger_wakeup(enum RPU_SLEEP_TYPE val) { return; }
+#endif /* RPU_SLEEP_ENABLE */
+```
+
+`RPU_SLEEP_ENABLE` is defined (`EXTRA_CFLAGS += -DRPU_SLEEP_ENABLE`), so they do
+compile — they just do nothing. The `hal_ops` table wires them up, but the only
+reachable callers are the `sleep=` / `wakeup=` procfs commands, which therefore
+also do nothing, and the one place in `hal.c` that would have woken the chip
+before a transfer is commented out in the BSP too:
+
+```c
+#if 0//def RPU_SLEEP_ENABLE
+		if (check_and_wakeup_rpu_nonblocking() == false) {
+```
+
+So the port did not drop a working wake path; it dropped dead scaffolding. What
+it did drop that mattered is the module_param, which was the only way to stop the
+chip sleeping in the first place:
 
 ```c
 BSP:  unsigned int lpw_no_sleep = 0;  module_param(lpw_no_sleep, int, 0);
@@ -74,10 +97,12 @@ insmod $ko_path/rk915.ko down_fw_in_probe=1 default_phy_threshold=180 lpw_no_sle
 passing three parameters the module no longer accepts. As shipped, that script
 cannot load the driver.
 
-**This is a compensating fix, not the proper one.** The proper fix is to restore
-the wake path; this just stops the chip sleeping in the first place. It costs
-idle power. The parameter comes back so it can be switched off once a wake path
-exists:
+Since nothing anywhere can wake this chip, not sleeping is the only lever
+available. It costs idle power, and I would rather have a real wake path — but
+that would have to be written from scratch against hardware documentation I do
+not have. It is also, for what it is worth, what the vendor's own
+`rk915_rftest.sh` does. The parameter comes back so it can be switched off if a
+wake path is ever implemented:
 
 ```diff
 --- a/src/procfs.c	2026-08-26 21:59:06.219423215 -0400
@@ -545,11 +570,21 @@ The ring records data transfers only, not CMD52.
 | Tickless idle | `nohz=off` — no change |
 | Dropping `cap-sdio-irq` | breaks bring-up entirely: the core falls back to a polling SDIO irq thread whose CMD52s collide with the driver (`rk915_serias_read: error -110`) |
 
-If there is a documented handshake for the host-wake line, or a flow-control or
-buffer-credit rule around `num_frames_per_desc`, that is where I would look
-next. The datasheet in `docs/` does not help: it runs to introduction, package
-information and electrical specification, with no register map and nothing on
-the host interface protocol.
+**The missing wake path may matter here.** As established under known issue 1,
+neither tree can wake this chip — every wake function is an empty stub and the
+one call site is `#if 0`'d. `lpw_no_sleep=1` asks the firmware not to sleep, and
+it is honoured well enough that the link survives 13 h of bursty traffic. But if
+the firmware ever drops into a low-power state for some reason `LMAC_NO_SLEEP`
+does not cover — buffer exhaustion under sustained transfer would be a candidate
+— then the host has no way whatsoever to bring it back, and what you would see is
+exactly the signature above: the chip stops mid-idle, the host-wake GPIO goes
+quiet, and only a power cycle recovers it. I cannot confirm that without knowing
+what the firmware does, but it is where I would look first.
+
+Failing that, a flow-control or buffer-credit rule around `num_frames_per_desc`
+would be the next thing to check. The datasheet in `docs/` does not help either
+way: it runs to introduction, package information and electrical specification,
+with no register map and nothing on the host interface protocol.
 
 
 ## Aside: MAC address
