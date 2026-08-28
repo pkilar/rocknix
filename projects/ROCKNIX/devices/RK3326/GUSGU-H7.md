@@ -20,7 +20,7 @@ workaround, not a real fix; see §8.
 | Debug UART | **UART5** @ `0xff178000`, 1500000 8N1 |
 | Buttons | 19 GPIO lines (17 on gpio3, 2 on gpio2) |
 | Stick | one (left): **X on SARADC ch1, Y on ch2**, direct, no analog mux (ch0/ch3 unconnected) |
-| RGB LEDs | three **WS2812** on `spi1` MOSI (`gpio3 RK_PB4`), one chain |
+| LEDs | three **WS2812** in the stick ring on `spi1` MOSI (`gpio3 RK_PB4`); one red charging LED on `gpio0 RK_PC1`. No button LED. |
 | Sound | rk817 codec + external speaker amp on `gpio3 RK_PA7`, hp-det `gpio2 RK_PC6` |
 | Stock bootloader | **U-Boot 2017.09** vendor fork on eMMC |
 
@@ -436,10 +436,25 @@ stock tree agrees on both pins: `spk-ctl-gpios = <&gpio3 7 0>` with
 codec already had `#sound-dai-cells`, so enabling the card was the only change -
 one line of the compiled dtb.
 
-## 8b. RGB LEDs
+## 8b. LEDs
 
-The illuminated button and the ring around the analog stick are **WS2812**
-addressable LEDs on `spi1` MOSI - three of them, one chain.
+This board has exactly two light sources, established by driving every
+candidate on the hardware rather than by reading the DT:
+
+| | |
+|---|---|
+| stick ring | three **WS2812** on `spi1` MOSI, one chain |
+| charging | one red LED on `gpio0 RK_PC1` |
+
+There is **no illuminated button**, and the ring is the whole WS2812 chain -
+sending pixels 3..9 lights nothing, while the same frame sent to 0..2 lights the
+ring, so the chain is three pixels and not merely three *driven* pixels.
+
+eeclone also declares a blue power LED on `gpio0 RK_PA0`. That pin drives
+nothing here - it sat at brightness 1 with a `default-on` trigger from boot with
+no light, and toggling it by hand changed nothing - so the H7 deletes it rather
+than ship a phantom `/sys/class/leds` entry. The charging LED's trigger was
+`none`, meaning it never lit; it is now `battery-charging`.
 
 The stock device tree has no LED node at all, which is why nothing in it looked
 relevant. The stock firmware drives them from userspace: `udt_events.sh` cycles
