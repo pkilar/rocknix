@@ -209,6 +209,21 @@ All device interrupts on RK3326 are affine to CPU0, so the display (drm vblank
 timeouts), the SARADC and the network all stop and the machine needs a power
 cycle. Masking the bit when it fires with nothing to service fixes it:
 
+With the mask in place the same fault is a non-event — this is a live capture
+from an ordinary session, the storm contained and the machine unaffected:
+
+```
+dwmmc_rockchip ff380000.mmc: FIFO irq 0x10 with no transfer to service; masking
+dwmmc_rockchip ff380000.mmc: FIFO irq 0x10 with no transfer to service; masking
+rk915: rk915_data_write: addr=0 len=94 -16
+rk915: -------- fw error recovery (0) start --------
+rk915: fw error (0): requesting mac80211 restart
+```
+
+`0x10` is `SDMMC_INT_TXDR`. Each of those lines is a storm that would otherwise
+have taken the board down; instead the driver sees a normal `-EBUSY`, recovery
+runs, and the link comes back on its own.
+
 ```diff
 --- a/drivers/mmc/host/dw_mmc.c
 +++ b/drivers/mmc/host/dw_mmc.c
@@ -454,18 +469,29 @@ apart:
 
 This one is unsolved, and I want to be clear that it is **not** known issue 1
 resurfacing — with `lpw_no_sleep=1` the association is stable indefinitely, and
-this failure is triggered by data volume, not by elapsed time.
+this failure is triggered by continuous transfer, not by elapsed time.
 
-**It dies in well under a megabyte.** Three runs pushing a
-single TCP stream at a `nc` sink died after 0.20 MB, 0.46 MB and 0.79 MB, each
-within ~10 s of starting. Eight parallel keep-alive HTTP connections die just as
-reliably, after 10–80 requests. By contrast, 35 sequential HTTP bursts of ~49 KB
-each with a 12 s idle gap between them ran clean start to finish.
+**It dies in well under a megabyte of *continuous* transfer, in either
+direction.**
 
-So it is not concurrency as such — one connection is enough — and it is not time
-since association. It is the volume of data moved without a pause. Concurrency
-only matters because it is the easy way to generate that volume: a browser
-loading a directory listing is more than sufficient.
+| Test | Shape | Result |
+|---|---|---|
+| single TCP stream to a `nc` sink (device transmits) | 1 conn, continuous | died at 0.20 / 0.46 / 0.79 MB, each within ~10 s |
+| single TCP stream to a `nc` sink **on** the device (device receives) | 1 conn, continuous | died at 0.44 MB after 19 s |
+| 8 parallel keep-alive HTTP connections | 8 conns, continuous | dies after 10–80 requests, ~10 s |
+| 35 sequential HTTP bursts, ~49 KB, 12 s idle between | bursty | clean, all 35 |
+| ordinary idle/background use | bursty | **383 MB received over 13 h 44 m, zero faults** |
+
+Three things fall out of that:
+
+* **It is not concurrency.** One connection is enough.
+* **It is not direction.** Receiving kills it as readily as transmitting, at the
+  same order of magnitude. Both single-stream rows above are the same test with
+  the sink moved to the other end.
+* **It is not cumulative volume, and not time since association.** The same
+  device moved 383 MB and stayed associated for 13 h 44 m without a single fault,
+  because that traffic was bursty. What matters is *continuous* transfer: roughly
+  half a megabyte with no idle gap is enough, whichever way it flows.
 
 Minimal form — one stream, no HTTP, no concurrency. On any machine on the same
 LAN, then on the device:
