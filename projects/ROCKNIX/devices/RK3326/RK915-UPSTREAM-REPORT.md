@@ -505,7 +505,8 @@ direction.**
 | single TCP stream to a `nc` sink **on** the device (device receives) | 1 conn, continuous | died at 0.44 MB after 19 s |
 | 8 parallel keep-alive HTTP connections | 8 conns, continuous | dies after 10–80 requests, ~10 s |
 | 35 sequential HTTP bursts, ~49 KB, 12 s idle between | bursty | clean, all 35 |
-| ordinary idle/background use | bursty | **383 MB received over 13 h 44 m, zero faults** |
+| **24 MB rsync, rate-limited to 15 KB/s** | continuous | **clean, first attempt, no faults** |
+| ordinary idle/background use | bursty | 383 MB received over 13 h 44 m, zero faults |
 
 Three things fall out of that:
 
@@ -514,9 +515,17 @@ Three things fall out of that:
   same order of magnitude. Both single-stream rows above are the same test with
   the sink moved to the other end.
 * **It is not cumulative volume, and not time since association.** The same
-  device moved 383 MB and stayed associated for 13 h 44 m without a single fault,
-  because that traffic was bursty. What matters is *continuous* transfer: roughly
-  half a megabyte with no idle gap is enough, whichever way it flows.
+  device moved 383 MB and stayed associated for 13 h 44 m without a single fault.
+* **It is a throughput threshold.** This is the sharpest handle I have on it. A
+  24 MB transfer rate-limited to 15 KB/s completed cleanly in one attempt —
+  48× the volume that kills it at ~29 KB/s, moved continuously, with no faults at
+  all. So it is not "half a megabyte", it is "faster than roughly 15–29 KB/s for
+  more than a few seconds". Anything at or below ~15 KB/s appears to be safe
+  indefinitely, in either direction.
+
+That last row is also a practical workaround for anyone stuck: rate-limit and it
+works. `rsync --bwlimit=15` moved a 24 MB kernel image onto the device over this
+link without a single fault.
 
 Minimal form — one stream, no HTTP, no concurrency. On any machine on the same
 LAN, then on the device:
@@ -530,7 +539,7 @@ It dies inside ~10 s. The browser-shaped version, which is how I first hit it:
 
 ```python
 import threading, socket, base64
-auth = base64.b64encode(b"root:rocknix").decode()
+auth = base64.b64encode(b"root:rocknix").decode()   # ROCKNIX default login
 def worker(path):
     while True:
         s = socket.create_connection((IP, 80), timeout=8)
@@ -605,7 +614,7 @@ aliases {
 };
 ```
 
-Verified: the node comes up carrying `local-mac-address = 1e 28 78 e8 94 15`
+Verified: the node comes up carrying a `local-mac-address` property
 written by U-Boot, and `of_get_mac_address()` picks it up. Might be worth a line
 in the README, since the binding already documents both MAC properties.
 
