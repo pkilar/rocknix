@@ -10,7 +10,18 @@
 # See RK915-WIFI.md. This is a mitigation, not a fix: the underlying fault is
 # unresolved, and it cannot help the variant where the tx thread spins in the
 # SDIO busy-wait, because modprobe -r hangs there.
-DEAD='fw_bring_up: rk915_download_firmware failed'
+# The driver has more than one fatal face and they are not interchangeable:
+#
+#   fw_bring_up: rk915_download_firmware failed   the firmware re-download that
+#                                                 follows a runtime fw error
+#   rpu_core_init: wait_for_reset_complete failed the chip never comes out of
+#                  / RPUWIFI-80211IF: umac init failed   reset - this is the
+#                                                 boot race losing earlier, and
+#                                                 it never reaches a download,
+#                                                 so matching only the line
+#                                                 above misses it entirely and
+#                                                 the link stays down for good
+DEAD='fw_bring_up: rk915_download_firmware failed|rpu_core_init: wait_for_reset_complete failed|RPUWIFI-80211IF: umac init failed'
 COOLDOWN=60
 POLL=5
 
@@ -34,18 +45,23 @@ reload_driver() {
 # Boot-time check: the driver can lose the same race while the system is busy
 # starting up.
 sleep 30
-seen=$(dmesg | grep -c "$DEAD")
-if [ "$seen" -gt 0 ]; then
+seen=$(dmesg | grep -cE "$DEAD")
+if [ "$seen" -gt 0 ] && ! ip route | grep -q '^default'; then
+        # A fault was logged during boot AND the link is not working. The
+        # route check is only a second condition here, never the trigger on
+        # its own: with wifi unconfigured or out of range there is no route
+        # and no fault either, and reloading then would churn the driver and
+        # restart iwd underneath the user for nothing.
         reload_driver
-        seen=$(dmesg | grep -c "$DEAD")
+        seen=$(dmesg | grep -cE "$DEAD")
 fi
 
 while true; do
         sleep $POLL
-        now=$(dmesg | grep -c "$DEAD")
+        now=$(dmesg | grep -cE "$DEAD")
         if [ "$now" -gt "$seen" ]; then
                 reload_driver
-                seen=$(dmesg | grep -c "$DEAD")
+                seen=$(dmesg | grep -cE "$DEAD")
                 sleep $COOLDOWN
         elif [ "$now" -lt "$seen" ]; then
                 seen=$now          # ring buffer wrapped
