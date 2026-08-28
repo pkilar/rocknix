@@ -165,9 +165,20 @@ so "the driver did nothing" is not established — only that no data moved.
 ## Where a fix should start
 
 This is a firmware/protocol-level fault in a WIP mainline port of a vendor
-driver, and chasing it further needs the chip documentation the porter has and
-this investigation does not. The evidence worth handing upstream is in
-`RK915-UPSTREAM-REPORT.md`.
+driver. The upstream branch we build from
+(`sunshineinabox/rk915`, `WIP-RK915_7.1`) lists it as a known issue in its own
+README - *"Soon after association chip disconnects from network"* - so it is not
+something this port introduced. Its second known issue, *"Unloading the driver
+will likely stall your system"*, **is** fixed here, by arming the dw_mmc data
+timeout for writes.
+
+Our DTS matches their `docs/mainline-linux-dts-example.dtsi` property for
+property (only the host-wake pin differs, correctly), and our quirks patch is
+byte-identical to theirs, so nothing in their instructions is missing. The
+datasheet in their `docs/` is electrical only - pinout and DC characteristics -
+with no SDIO protocol or firmware interface.
+
+The evidence worth handing upstream is in `RK915-UPSTREAM-REPORT.md`.
 
 ## Method note
 
