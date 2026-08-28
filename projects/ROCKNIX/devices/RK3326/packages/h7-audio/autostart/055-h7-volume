@@ -1,0 +1,47 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+#
+# Re-apply the saved volume once the audio sink actually exists.
+#
+# common/050-audio sets the volume with a single
+#
+#     pactl -- set-sink-volume @DEFAULT_SINK@ ${VOLUME}%
+#
+# and ignores the result. On this board the codec is a deferred probe
+# ("rk817-sound-amplified: deferred probe pending"), so the sink sometimes is
+# not there yet when that runs. The write is silently lost, the sink keeps its
+# 1.0 default, and the handheld comes up at full volume - while the stored
+# setting still reads whatever the user chose, so the number looks right and
+# the sound does not. The first volume keypress then "fixes" it, because that
+# is the first write that actually lands.
+#
+# Wait for the sink, then re-apply. Runs from /usr/lib/autostart/${HW_DEVICE},
+# which the autostart runner executes *after* the common scripts - device
+# quirks run before them and would just be overwritten by 050-audio.
+
+. /etc/profile.d/001-functions
+
+[ "${QUIRK_DEVICE}" = "Gusgu H7" ] || exit 0
+
+# Up to ~15s for the deferred codec probe to produce a sink.
+i=0
+while [ ${i} -lt 30 ]; do
+  if wpctl get-volume @DEFAULT_AUDIO_SINK@ >/dev/null 2>&1; then
+    break
+  fi
+  i=$((i + 1))
+  sleep 0.5
+done
+
+VOLUME="$(get_setting audio.volume)"
+case "${VOLUME}" in
+  ''|*[!0-9]*) VOLUME=60 ;;
+esac
+
+/usr/bin/volume "${VOLUME}" >/dev/null 2>&1
+
+# Verify it landed; fall back to wpctl if pactl silently did nothing.
+ACTUAL="$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | awk '{print int($2 * 100 + 0.5)}')"
+if [ -n "${ACTUAL}" ] && [ "${ACTUAL}" -ne "${VOLUME}" ]; then
+  wpctl set-volume @DEFAULT_AUDIO_SINK@ "${VOLUME}%" >/dev/null 2>&1
+fi
