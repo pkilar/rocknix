@@ -51,14 +51,128 @@ rk915: -------- fw error recovery (0) start --------
 
 and the driver unloads normally.
 
+```diff
+--- a/drivers/mmc/host/dw_mmc.c	2026-08-28 09:46:06.481799386 -0400
++++ b/drivers/mmc/host/dw_mmc.c	2026-08-28 09:46:06.482882724 -0400
+@@ -2025,10 +2065,13 @@
+ 						&host->pending_events)) {
+ 				/*
+ 				 * If all data-related interrupts don't come
+-				 * within the given time in reading data state.
++				 * within the given time. Armed for writes too:
++				 * the hardware data timeout does not cover the
++				 * write data phase, so a write to a card that
++				 * has stopped responding otherwise leaves
++				 * mmc_wait_for_req() waiting forever.
+ 				 */
+-				if (host->dir_status == MMC_DATA_READ)
+-					dw_mci_set_drto(host);
++				dw_mci_set_drto(host);
+ 				break;
+ 			}
+ 
+@@ -2063,12 +2106,11 @@
+ 		case STATE_DATA_BUSY:
+ 			if (!dw_mci_clear_pending_data_complete(host)) {
+ 				/*
+-				 * If data error interrupt comes but data over
+-				 * interrupt doesn't come within the given time.
+-				 * in reading data state.
++				 * If a data error interrupt comes but data over
++				 * does not follow within the given time. Armed
++				 * for writes as well, for the reason above.
+ 				 */
+-				if (host->dir_status == MMC_DATA_READ)
+-					dw_mci_set_drto(host);
++				dw_mci_set_drto(host);
+ 				break;
+ 			}
+ 
+```
+
 We also hit a `dw_mmc` interrupt storm worth knowing about: `TXDR`/`RXDR` are
 enabled unconditionally by the initial `INTMASK` and never masked for DMA
 transfers, where `host->sg` is NULL and the handler can only clear the latch.
 Harmless while DMA drains the FIFO — but when the card dies the condition
 persists and the level-triggered line storms at ~684,000/s, which on RK3326
 (where all device interrupts are affine to CPU0) takes the whole machine down.
-Masking them for the duration of a DMA transfer fixes it. Happy to send both
-patches.
+Masking them for the duration of a DMA transfer fixes it:
+
+```diff
+--- a/drivers/mmc/host/dw_mmc.c	2026-08-28 09:46:06.481799386 -0400
++++ b/drivers/mmc/host/dw_mmc.c	2026-08-28 09:46:06.482882724 -0400
+@@ -1109,6 +1109,23 @@
+ 		host->prev_blksz = 0;
+ 	} else {
+ 		/*
++		 * DMA services the FIFO, so TXDR/RXDR are not used here. They
++		 * are nevertheless left enabled by the INTMASK written at probe
++		 * and never turned off again, so they fire throughout every DMA
++		 * transfer with host->sg == NULL. That is normally harmless -
++		 * the DMA drains the FIFO and the condition clears - but if the
++		 * card stops responding mid-transfer the condition persists and
++		 * the level-triggered line storms: ~684,000 interrupts/second
++		 * measured on an RK3326, which starves every other interrupt on
++		 * that CPU and hangs the machine.
++		 */
++		spin_lock_irqsave(&host->irq_lock, irqflags);
++		temp = mci_readl(host, INTMASK);
++		temp &= ~(SDMMC_INT_TXDR | SDMMC_INT_RXDR);
++		mci_writel(host, INTMASK, temp);
++		spin_unlock_irqrestore(&host->irq_lock, irqflags);
++
++		/*
+ 		 * Keep the current block size.
+ 		 * It will be used to decide whether to update
+ 		 * fifoth register next time.
+@@ -1554,6 +1571,29 @@
+ 	}
+ }
+ 
++/*
++ * TXDR/RXDR ask for the FIFO to be serviced by the CPU. If there is no transfer
++ * left to service - host->sg is NULL - the handler can only clear the latch, the
++ * underlying FIFO condition persists, and the level-triggered line is re-raised
++ * immediately. Mask the bit; dw_mci_submit_data() re-enables it for the next PIO
++ * transfer.
++ */
++static void dw_mci_mask_stuck_fifo_irq(struct dw_mci *host, u32 bit)
++{
++	unsigned long irqflags;
++	u32 int_mask;
++
++	spin_lock_irqsave(&host->irq_lock, irqflags);
++	int_mask = mci_readl(host, INTMASK);
++	if (int_mask & bit) {
++		mci_writel(host, INTMASK, int_mask & ~bit);
++		dev_err_ratelimited(host->dev,
++				    "FIFO irq %#x with no transfer to service; masking\n",
++				    bit);
++	}
++	spin_unlock_irqrestore(&host->irq_lock, irqflags);
++}
++
+ static void __dw_mci_enable_sdio_irq(struct dw_mci *host, int enb)
+ {
+ 	unsigned long irqflags;
+@@ -2749,12 +2791,16 @@
+ 			mci_writel(host, RINTSTS, SDMMC_INT_RXDR);
+ 			if (host->dir_status == MMC_DATA_READ && host->sg)
+ 				dw_mci_read_data_pio(host, false);
++			else
++				dw_mci_mask_stuck_fifo_irq(host, SDMMC_INT_RXDR);
+ 		}
+ 
+ 		if (pending & SDMMC_INT_TXDR) {
+ 			mci_writel(host, RINTSTS, SDMMC_INT_TXDR);
+ 			if (host->dir_status == MMC_DATA_WRITE && host->sg)
+ 				dw_mci_write_data_pio(host);
++			else
++				dw_mci_mask_stuck_fifo_irq(host, SDMMC_INT_TXDR);
+ 		}
+ 
+ 		if (pending & SDMMC_INT_CMD_DONE) {
+```
 
 ---
 
@@ -99,6 +213,34 @@ reset, re-enabled and had its block size restored, makes recovery work:
 **23 recoveries, 31 successful firmware downloads, 0 failures**, link back with
 the same interface and DHCP lease.
 
+```diff
+--- a/src/sdio.c	2026-08-27 13:24:01.819863640 -0400
++++ b/src/sdio.c	2026-08-27 13:24:01.820603502 -0400
+@@ -542,6 +542,22 @@
+ 		ret = sdio_enable_func(func);
+ 	if (!ret)
+ 		ret = sdio_set_block_size(func, 512);
++	if (!ret) {
++		/*
++		 * _sdio_reset() latches sdio_reset on the first io error, and
++		 * every accessor then returns 0 *without doing any i/o*. The
++		 * latch was only ever cleared by sdio_probe(), so after one
++		 * error the firmware download that error recovery depends on
++		 * writes into nothing while reporting success - 4KB "written"
++		 * in 2us - the readback is all zeroes, the chip never reaches
++		 * WAIT_PATCH, and mac80211 tears the device down. That is why
++		 * only a module reload ever brought the link back.
++		 *
++		 * The card has just been reset, re-enabled and had its block
++		 * size restored, so i/o is valid again: drop the latch.
++		 */
++		sdio_reset = false;
++	}
+ 	sdio_release_host(func);
+ 	if (ret)
+ 		rk915_err("%s: failed (%d)\n", __func__, ret);
+```
+
 ## Bug: vif accounting is never reset across a hardware restart
 
 `current_vif_count` / `active_vifs` are cleared only in `rpu_init()`. mac80211
@@ -114,6 +256,35 @@ rk915: add_interface: Exceeded Maximum supported VIF's cur:2 max: 2
 firmware reload. Clearing both in `start()` fixes it — `start()` always runs
 before interfaces are re-added.
 
+```diff
+--- a/src/umac_if.c	2026-08-27 13:24:01.825222478 -0400
++++ b/src/umac_if.c	2026-08-27 13:24:01.826363899 -0400
+@@ -607,6 +607,23 @@
+ 	INIT_DELAYED_WORK(&priv->roc_complete_work, rpu_roc_complete_work);
+ 
+ 	priv->state = STARTED;
++
++	/*
++	 * mac80211 re-adds every interface after a hardware restart, but it
++	 * never calls remove_interface() for the ones that were up before, and
++	 * the vif accounting is otherwise only cleared by rpu_init() at module
++	 * load. Without this the second restart trips
++	 *
++	 *   rk915: add_interface: Exceeded Maximum supported VIF's cur:2 max: 2
++	 *
++	 * add_interface() returns -ENOTSUPP, mac80211 tears the interface down
++	 * and the link never comes back even though the firmware reloaded
++	 * cleanly. start() is always called before interfaces are re-added, so
++	 * this is the right place to drop the stale accounting.
++	 */
++	priv->current_vif_count = 0;
++	priv->active_vifs = 0;
++
+ 	memset(priv->params->pdout_voltage, 0,
+ 		sizeof(char) * MAX_AUX_ADC_SAMPLES);
+ 
+```
+
 ## Minor: racy firmware-error claim
 
 `rk915_signal_io_error()` guards with a plain test-then-set, so the rx and tx
@@ -126,6 +297,30 @@ apart:
 ```
 
 `cmpxchg()` on `fw_error_processing` fixes it.
+
+```diff
+--- a/src/umac_if.c	2026-08-27 11:14:36.689792575 -0400
++++ b/src/umac_if.c	2026-08-27 11:14:36.690819895 -0400
+@@ -464,10 +464,16 @@
+ 		return;
+ 	hal->fw_error = 1;
+ 	rk915_wake_waiters(hal);
+-	if (!hal->fw_error_processing) {
++	/*
++	 * The rx and tx threads both signal io errors, and a plain
++	 * test-then-set lets both through: two recoveries start within
++	 * microseconds of each other and ieee80211_restart_hw() is called
++	 * twice, the second landing while the first restart is still in
++	 * flight. Claim the recovery atomically so exactly one runs.
++	 */
++	if (cmpxchg(&hal->fw_error_processing, 0, 1) == 0) {
+ 		__pm_stay_awake(hal->fw_err_ws);
+ 
+-		hal->fw_error_processing = 1;
+ 		hal->fw_error_counter++;
+ 		hal->fw_error_reason = reason;
+ 
+```
 
 ---
 
@@ -204,3 +399,17 @@ aliases {
 Verified: the node comes up carrying `local-mac-address = 1e 28 78 e8 94 15`
 written by U-Boot, and `of_get_mac_address()` picks it up. Might be worth a line
 in the README, since the binding already documents both MAC properties.
+
+---
+
+## Note on what is deliberately *not* in these patches
+
+Our tree briefly carried three further dw_mmc guards: bailing out of
+`dw_mci_wait_while_busy()` and of `dw_mci_interrupt()` on an all-ones register
+read, and acknowledging abnormal IDMAC bits. Each came from a hypothesis about
+the interrupt storm that turned out to be wrong, and none of them ever fired once
+the real cause was found. They have been dropped rather than offered as
+speculative hardening.
+
+All patches above are against mainline 7.1.2 and this branch at `86f0d0e0`, and
+are running on hardware here.
