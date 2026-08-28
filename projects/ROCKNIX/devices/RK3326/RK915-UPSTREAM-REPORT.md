@@ -1,16 +1,18 @@
 # Upstream report — draft for `sunshineinabox/rk915`, branch `WIP-RK915_7.1`
 
-Filed against the branch we build from, following `docs/` as written: the 7.1
+Filed against the branch I build from, following `docs/` as written: the 7.1
 quirks patch, the DTS example, and `firmware/rockchip`. Hardware is a Gusgu H7
 (RK3326/PX30), mainline 7.1.2, driver at `86f0d0e0`.
 
-Our device tree matches `docs/mainline-linux-dts-example.dtsi` property for
+My device tree matches `docs/mainline-linux-dts-example.dtsi` property for
 property, differing only in the host-wake pin (`RK_PA1` on this board rather than
-`RK_PA5`), and our copy of the quirks patch is byte-identical to yours.
+`RK_PA5`), and my copy of the quirks patch is byte-identical to yours.
 
 The README lists two known issues. **The second one has a fix below.** The first
-one we could not solve, but we can hand you a deterministic reproducer and a list
-of what it is not.
+one I could not solve, but I can offer a deterministic reproducer, a list of what
+it is not — and a correction to how it is described: the chip does not drift off
+the network after association, it dies on the first few hundred KB of sustained
+traffic.
 
 ---
 
@@ -90,7 +92,7 @@ and the driver unloads normally.
  
 ```
 
-We also hit a `dw_mmc` interrupt storm worth knowing about: `TXDR`/`RXDR` are
+I also hit a `dw_mmc` interrupt storm worth knowing about: `TXDR`/`RXDR` are
 enabled unconditionally by the initial `INTMASK` and never masked for DMA
 transfers, where `host->sg` is NULL and the handler can only clear the latch.
 Harmless while DMA drains the FIFO — but when the card dies the condition
@@ -324,13 +326,38 @@ apart:
 
 ---
 
-## Known issue 1: "Soon after association chip disconnects from network"
+## Known issue 1 — the description does not match what I see
 
-Still unsolved here, but we can narrow it.
+The README says *"Soon after association chip disconnects from network"*. That is
+not what happens on my hardware, and the difference matters for anyone trying to
+reproduce it.
 
-**It needs concurrency.** 35 sequential HTTP fetches were clean; 8 parallel
-keep-alive connections kill it in ~10 s, after 10–80 requests. Any several
-simultaneous TCP flows will do — a browser loading a directory listing is enough:
+**The association is stable.** This device has held its link for nearly 13 hours
+continuously, idle and under light traffic, with no disconnect. Time since
+association is not the variable.
+
+**Sustained traffic kills it, in well under a megabyte.** Three runs pushing a
+single TCP stream at a `nc` sink died after 0.20 MB, 0.46 MB and 0.79 MB, each
+within ~10 s of starting. Eight parallel keep-alive HTTP connections die just as
+reliably, after 10–80 requests. By contrast, 35 sequential HTTP bursts of ~49 KB
+each with a 12 s idle gap between them ran clean start to finish.
+
+So it is not concurrency as such — one connection is enough — and it is not time
+since association. It is the volume of data moved without a pause. Concurrency
+only matters because it is the easy way to generate that volume, which is
+probably why this reads as "disconnects soon after association": the first thing
+anyone does after associating is open a browser, and a directory listing is
+enough to cross the threshold.
+
+Minimal form — one stream, no HTTP, no concurrency. On any machine on the same
+LAN, then on the device:
+
+```sh
+laptop$  nc -l -p 5001 > /dev/null
+device$  dd if=/dev/zero bs=64k | nc $LAPTOP_IP 5001
+```
+
+It dies inside ~10 s. The browser-shaped version, which is how I first hit it:
 
 ```python
 import threading, socket, base64
@@ -375,7 +402,7 @@ The ring records data transfers only, not CMD52.
 | Dropping `cap-sdio-irq` | breaks bring-up entirely: the core falls back to a polling SDIO irq thread whose CMD52s collide with the driver (`rk915_serias_read: error -110`) |
 
 If there is a documented handshake for the host-wake line, or a flow-control or
-buffer-credit rule around `num_frames_per_desc`, that is where we would look
+buffer-credit rule around `num_frames_per_desc`, that is where I would look
 next — the hardware datasheet in `docs/` is electrical only.
 
 ## Aside: MAC address
@@ -404,7 +431,7 @@ in the README, since the binding already documents both MAC properties.
 
 ## Note on what is deliberately *not* in these patches
 
-Our tree briefly carried three further dw_mmc guards: bailing out of
+My tree briefly carried three further dw_mmc guards: bailing out of
 `dw_mci_wait_while_busy()` and of `dw_mci_interrupt()` on an all-ones register
 read, and acknowledging abnormal IDMAC bits. Each came from a hypothesis about
 the interrupt storm that turned out to be wrong, and none of them ever fired once
