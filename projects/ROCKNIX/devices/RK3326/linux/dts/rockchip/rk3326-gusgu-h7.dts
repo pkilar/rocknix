@@ -514,3 +514,33 @@
 &{/rk817-sound-amplified} {
 	status = "okay";
 };
+
+/*
+ * RGB LEDs (the illuminated button and the ring around the analog stick).
+ *
+ * These are WS2812-style addressable LEDs on a single data line, not anything
+ * the LED class can drive: the stock firmware has no LED node in its device
+ * tree at all and instead runs a userspace binary, /usr/bin/ws2812, which
+ * talks to /dev/spidev1.0 and encodes the WS2812 bit timing into the SPI
+ * bitstream. Only MOSI actually reaches the LEDs; CLK is there to clock the
+ * pattern out at the right rate.
+ *
+ * Pins are taken from the stock tree and deliberately avoid CS0: mainline's
+ * spi1_csn0 is gpio3 RK_PB1, which is a button on this board. The stock tree
+ * muxes spi1_csn1 (RK_PB2) instead, which is free. Nothing else collides —
+ * the buttons take PB0/PB1/PB3/PB5 and SPI1 takes PB2/PB4/PB6/PB7.
+ *
+ * "rohm,bh2228fv" is the conventional generic compatible for a raw spidev
+ * node; the stock tree's "rockchip,spidev" is not a mainline binding.
+ */
+&spi1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi1_clk>, <&spi1_csn1>, <&spi1_miso>, <&spi1_mosi>;
+	status = "okay";
+
+	rgb_leds: spidev@0 {
+		compatible = "rohm,bh2228fv";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+	};
+};
