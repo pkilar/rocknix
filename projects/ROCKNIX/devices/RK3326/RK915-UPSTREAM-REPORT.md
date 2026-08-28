@@ -4,9 +4,19 @@ Filed against the branch I build from, following `docs/` as written: the 7.1
 quirks patch, the DTS example, and `firmware/rockchip`. Hardware is a Gusgu H7
 (RK3326/PX30), mainline 7.1.2, driver at `86f0d0e0`.
 
-My device tree matches `docs/mainline-linux-dts-example.dtsi` property for
-property, differing only in the host-wake pin (`RK_PA1` on this board rather than
-`RK_PA5`), and my copy of the quirks patch is byte-identical to yours.
+My device tree brings `&sdio` to the same state as
+`docs/mainline-linux-dts-example.dtsi` — same pwrseq, same host properties, same
+`wifi@1` node — differing only in the host-wake pin, which is `RK_PA1` on this
+board rather than `RK_PA5`. (It also carries `/delete-property/` lines, but only
+to strip the SD-slot properties this board's base DTS puts on that same node, and
+an `ethernet0` alias, which is the MAC change described at the end.)
+
+My copy of the quirks patch has a byte-identical diff body to yours; the only
+difference is a commit message on top. I took the quirks route rather than
+`docs/mainline-linux-hacks-for-rk915.patch`; the two do the same three things,
+the hacks patch expressing them as a `MMC_CAP2_WIFI_RK912` cap against 6.12.29
+and the quirks patch as `MMC_QUIRK_BROKEN_SDIO_FUNCE` /
+`MMC_QUIRK_SDIO_CONT_CLOCK` / `MMC_QUIRK_SDIO_CMD52_WAIT_DATA`.
 
 **Both known issues have fixes below**, along with three further bugs I hit on
 the way. Both README descriptions were accurate — I reproduced each one exactly
@@ -52,6 +62,17 @@ port: unsigned int lpw_no_sleep;
 So the chip sleeps at the first idle moment after association — which is exactly
 why association itself succeeds, since it keeps the chip busy — and nothing ever
 wakes it. That is the defect the README describes.
+
+The parameter loss looks accidental rather than deliberate: the BSP declared nine
+`module_param`s, the port declares two (`debug_mask`, `patch_features`) — yet the
+port still ships `rk915_rftest.sh`, which at lines 152 and 173 runs
+
+```sh
+insmod $ko_path/rk915.ko down_fw_in_probe=1 default_phy_threshold=180 lpw_no_sleep=1
+```
+
+passing three parameters the module no longer accepts. As shipped, that script
+cannot load the driver.
 
 **This is a compensating fix, not the proper one.** The proper fix is to restore
 the wake path; this just stops the chip sleeping in the first place. It costs
@@ -122,9 +143,9 @@ rk915: -------- fw error recovery (0) start --------
 and the driver unloads normally.
 
 ```diff
---- a/drivers/mmc/host/dw_mmc.c	2026-08-28 09:46:06.481799386 -0400
-+++ b/drivers/mmc/host/dw_mmc.c	2026-08-28 09:46:06.482882724 -0400
-@@ -2025,10 +2065,13 @@
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -2025,10 +2048,13 @@
  						&host->pending_events)) {
  				/*
  				 * If all data-related interrupts don't come
@@ -141,7 +162,7 @@ and the driver unloads normally.
  				break;
  			}
  
-@@ -2063,12 +2106,11 @@
+@@ -2063,12 +2089,11 @@
  		case STATE_DATA_BUSY:
  			if (!dw_mci_clear_pending_data_complete(host)) {
  				/*
@@ -160,42 +181,38 @@ and the driver unloads normally.
  
 ```
 
-I also hit a `dw_mmc` interrupt storm worth knowing about: `TXDR`/`RXDR` are
-enabled unconditionally by the initial `INTMASK` and never masked for DMA
-transfers, where `host->sg` is NULL and the handler can only clear the latch.
-Harmless while DMA drains the FIFO — but when the card dies the condition
-persists and the level-triggered line storms at ~684,000/s, which on RK3326
-(where all device interrupts are affine to CPU0) takes the whole machine down.
-Masking them for the duration of a DMA transfer fixes it:
+I also hit a `dw_mmc` interrupt storm worth knowing about, because it is what
+turns "the wifi died" into "the handheld is bricked until you pull the battery".
+
+`TXDR`/`RXDR` ask for the FIFO to be serviced by the CPU and are only meaningful
+for PIO. `dw_mci_submit_data_dma()` does mask them for the duration of a DMA
+transfer, so DMA itself is covered — but **nothing masks them once a transfer is
+over**. They are enabled by `dw_mci_probe()`, enabled again by
+`dw_mci_runtime_resume()`, and re-enabled by every PIO transfer in
+`dw_mci_submit_data()`; the only thing that ever clears them again is the *next*
+DMA transfer. A driver like this one, which mixes CMD52 (PIO) with block
+transfers, therefore leaves them enabled for long stretches with `host->sg ==
+NULL`, and in that state the handler can only clear the latch.
+
+Harmless while the FIFO condition is transient. When the card dies it persists,
+clearing the latch achieves nothing, and the level-triggered line is re-raised
+immediately. Per-irq tracing caught the dwmmc count advancing by ~697,000 between
+two consecutive samples while every other interrupt on that CPU stayed frozen at
+a fixed count:
+
+```
+IRQTRACE 344 dwmci: 56:164736147  vop=11531 adc=24734 ser=418 gpio=10946
+IRQTRACE 345 dwmci: 56:165433415  vop=11531 adc=24734 ser=418 gpio=10946
+```
+
+All device interrupts on RK3326 are affine to CPU0, so the display (drm vblank
+timeouts), the SARADC and the network all stop and the machine needs a power
+cycle. Masking the bit when it fires with nothing to service fixes it:
 
 ```diff
---- a/drivers/mmc/host/dw_mmc.c	2026-08-28 09:46:06.481799386 -0400
-+++ b/drivers/mmc/host/dw_mmc.c	2026-08-28 09:46:06.482882724 -0400
-@@ -1109,6 +1109,23 @@
- 		host->prev_blksz = 0;
- 	} else {
- 		/*
-+		 * DMA services the FIFO, so TXDR/RXDR are not used here. They
-+		 * are nevertheless left enabled by the INTMASK written at probe
-+		 * and never turned off again, so they fire throughout every DMA
-+		 * transfer with host->sg == NULL. That is normally harmless -
-+		 * the DMA drains the FIFO and the condition clears - but if the
-+		 * card stops responding mid-transfer the condition persists and
-+		 * the level-triggered line storms: ~684,000 interrupts/second
-+		 * measured on an RK3326, which starves every other interrupt on
-+		 * that CPU and hangs the machine.
-+		 */
-+		spin_lock_irqsave(&host->irq_lock, irqflags);
-+		temp = mci_readl(host, INTMASK);
-+		temp &= ~(SDMMC_INT_TXDR | SDMMC_INT_RXDR);
-+		mci_writel(host, INTMASK, temp);
-+		spin_unlock_irqrestore(&host->irq_lock, irqflags);
-+
-+		/*
- 		 * Keep the current block size.
- 		 * It will be used to decide whether to update
- 		 * fifoth register next time.
-@@ -1554,6 +1571,29 @@
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -1554,6 +1554,29 @@
  	}
  }
  
@@ -225,7 +242,7 @@ Masking them for the duration of a DMA transfer fixes it:
  static void __dw_mci_enable_sdio_irq(struct dw_mci *host, int enb)
  {
  	unsigned long irqflags;
-@@ -2749,12 +2791,16 @@
+@@ -2749,12 +2774,16 @@
  			mci_writel(host, RINTSTS, SDMMC_INT_RXDR);
  			if (host->dir_status == MMC_DATA_READ && host->sg)
  				dw_mci_read_data_pio(host, false);
@@ -257,15 +274,48 @@ success without performing any i/o**:
 ```c
 static int sdio_send_data(struct host_io_info *host, u32 addr, u8 *buf, u32 len)
 {
-        if (sdio_reset == true)
-                return 0;
-        return sdio_memcpy_toio(func, addr, buf, len);
+	struct sdio_func *func = (struct sdio_func *)host->priv_data;
+
+	if (sdio_reset == true)
+		return 0;
+
+	return sdio_memcpy_toio(func, addr, buf, len);
 }
 ```
 
-`rk915_io_reset()` arms it from six sites in `hal_io.c`, so any io error sets it,
-and nothing clears it except `sdio_probe()`. So the firmware re-download that
-error recovery depends on writes into nothing:
+`rk915_io_reset()` arms it from six call sites in `hal_io.c`, so any io error
+sets it. Two places clear it, and **neither runs during recovery**:
+
+* `sdio_probe()` — only on a fresh probe, i.e. a module reload.
+* `rk915_sdio_recovery_init()` — which looks like exactly the right place, but
+  its only caller is `rk915_platform_bus_rec_init()`, and that function is
+  called from nowhere in the tree. `nm` confirms both symbols are compiled and
+  neither is referenced; the path is dead.
+
+That dead path is the regression. The BSP's `fw_bring_up()` did call it:
+
+```c
+if (hpriv->fw_error_processing) {
+	rk915_poweron();
+	mdelay(RK915_POWER_ON_DELAY_MS);
+	rk915_platform_bus_rec_init(priv->io_info);   /* clears sdio_reset */
+	mdelay(RK915_POWER_ON_DELAY_MS);
+} else {
+```
+
+the port replaced that arm with `rk915_sdio_power_cycle()`:
+
+```c
+if (priv->fw_error_processing) {
+	if (rk915_sdio_power_cycle(priv->io_info)) {
+		rk915_err("%s: power cycle failed\n", __func__);
+		return -1;
+	}
+} else {
+```
+
+and `rk915_sdio_power_cycle()` never clears the latch. So the firmware
+re-download that error recovery depends on writes into nothing:
 
 ```
 rk915: 30550/48056 bytes differ, first at 0x0 (wrote 0x81 read 0x00)
@@ -279,8 +329,12 @@ bytes in **2 µs** (~2 GB/s) versus 269 µs for the same block when it works. It
 also explains why reloading the module is the only thing that ever restores the
 link — `sdio_probe()` clears the latch.
 
-Clearing it at the end of `rk915_sdio_power_cycle()`, once the card has been
-reset, re-enabled and had its block size restored, makes recovery work:
+The minimal fix is to give the replacement function the responsibility the
+replaced one carried: clear the latch at the end of `rk915_sdio_power_cycle()`,
+once the card has been reset, re-enabled and had its block size restored. (If
+you would rather restore the BSP structure, re-wiring `fw_bring_up()` to call
+`rk915_platform_bus_rec_init()` — and deleting it if you do not — is the other
+way to close the same hole.) Either way recovery starts working:
 **23 recoveries, 31 successful firmware downloads, 0 failures**, link back with
 the same interface and DHCP lease.
 
@@ -467,7 +521,9 @@ The ring records data transfers only, not CMD52.
 
 If there is a documented handshake for the host-wake line, or a flow-control or
 buffer-credit rule around `num_frames_per_desc`, that is where I would look
-next — the hardware datasheet in `docs/` is electrical only.
+next. The datasheet in `docs/` does not help: it runs to introduction, package
+information and electrical specification, with no register map and nothing on
+the host interface protocol.
 
 
 ## Aside: MAC address
