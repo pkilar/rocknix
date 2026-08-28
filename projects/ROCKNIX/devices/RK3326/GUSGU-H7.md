@@ -20,6 +20,8 @@ workaround, not a real fix; see §8.
 | Debug UART | **UART5** @ `0xff178000`, 1500000 8N1 |
 | Buttons | 19 GPIO lines (17 on gpio3, 2 on gpio2) |
 | Stick | one (left): **X on SARADC ch1, Y on ch2**, direct, no analog mux (ch0/ch3 unconnected) |
+| RGB LEDs | three **WS2812** on `spi1` MOSI (`gpio3 RK_PB4`), one chain |
+| Sound | rk817 codec + external speaker amp on `gpio3 RK_PA7`, hp-det `gpio2 RK_PC6` |
 | Stock bootloader | **U-Boot 2017.09** vendor fork on eMMC |
 
 A copy of the stock DTB lives in `packages/u-boot/config/stock/` for the
@@ -419,6 +421,71 @@ moved 3.24 MB with 0 vblank timeouts, 0 RCU stalls, 0 driver faults and load
 average 0.71.
 
 Full account, including the measurements and the dead ends: **`RK915-WIFI.md`**.
+
+## 8a. Sound
+
+There was no ALSA card at all - `no soundcards found`, and not one ASoC line in
+dmesg. eeclone defines **two** candidate cards, `rk817-sound-amplified` and
+`rk817-sound-simple`, and ships both `disabled`, expecting the including board to
+pick one. The H7 picked neither.
+
+The H7 has an external amplifier, so the amplified card is the right one, and the
+stock tree agrees on both pins: `spk-ctl-gpios = <&gpio3 7 0>` with
+`use-ext-amplifier` matches eeclone's `spk_amp` on `gpio3 RK_PA7`, and
+`hp-det-gpio = <&gpio2 22 0>` is `RK_PC6`. `i2s1_2ch` was already enabled and the
+codec already had `#sound-dai-cells`, so enabling the card was the only change -
+one line of the compiled dtb.
+
+## 8b. RGB LEDs
+
+The illuminated button and the ring around the analog stick are **WS2812**
+addressable LEDs on `spi1` MOSI - three of them, one chain.
+
+The stock device tree has no LED node at all, which is why nothing in it looked
+relevant. The stock firmware drives them from userspace: `udt_events.sh` cycles
+17 modes on the FN key via `ws2812 "$mode" &`, and that binary's only device
+string is `/dev/spidev1.0`.
+
+**Panel reset had to move first.** `spi1_clk` is `gpio3 RK_PB7`, which eeclone
+uses as the DSI panel reset, so SPI1 would not probe:
+
+```
+rockchip-pinctrl: pin gpio3-15 already requested by ff450000.dsi.0;
+                  cannot claim for ff1d8000.spi
+```
+
+eeclone's value is simply wrong for this board. The stock tree's st7703 node has
+`reset-gpios = <&gpio3 27 1>` - **RK_PD3**, active low - and muxes PB7 as
+spi1_clk. PD3 is otherwise unused here; the buttons stop at PD2. The display had
+come up anyway because U-Boot initialises the panel before Linux touches reset,
+so the bogus pin was a no-op. Corrected, and SPI1 probes.
+
+The rest of the pinout is deliberate on this board: buttons take gpio3
+PB0/PB1/PB3/PB5, SPI1 takes PB2/PB4/PB6/PB7. Note the stock tree muxes
+`spi1_csn1` (PB2), not csn0 - csn0 is PB1, a button.
+
+**The wire format**, captured from the stock binary with an LD_PRELOAD shim
+logging `ioctl(SPI_IOC_MESSAGE)` rather than guessed:
+
+| | |
+|---|---|
+| encoding | one SPI byte per WS2812 bit at the 8 MHz default: `0xc0` = 250 ns high = 0, `0xfc` = 750 ns high = 1 |
+| frame | 72 bytes = 3 LEDs x 24 |
+| colour order | GRB |
+| latch | none in-frame; the idle gap at ~94 Hz is the reset |
+
+`h7-rgb` reproduces that frame byte-for-byte. Usage:
+
+```bash
+h7-rgb 255 0 0      # all three red
+h7-rgb off
+h7-rgb demo         # walk each LED
+h7-rgb boot         # apply /storage/.config/h7-rgb.conf, else dim white
+```
+
+⚠️ If a colour change appears to do nothing, check nothing else is driving the
+chain - a leftover writer repainting at 95 Hz looks exactly like "my write did
+not work". `/proc/*/fd` for the spidev handle finds it; `pkill -x` did not.
 
 ### The device tree
 
