@@ -490,3 +490,27 @@
 		};
 	};
 };
+
+/*
+ * Sound.
+ *
+ * eeclone defines two candidate cards and ships both disabled, expecting the
+ * including board to pick one; the H7 picked neither, so no ALSA card was
+ * instantiated at all ("no soundcards found", and not a single ASoC line in
+ * dmesg).
+ *
+ * The H7 has an external speaker amplifier, so the amplified card is the right
+ * one. The stock tree agrees on both pins:
+ *
+ *   stock  spk-ctl-gpios = <&gpio3 7 0>    use-ext-amplifier
+ *   here   spk_amp enable-gpios = <&gpio3 RK_PA7 GPIO_ACTIVE_HIGH>
+ *
+ *   stock  hp-det-gpio   = <&gpio2 22 0>   (22 = RK_PC6)
+ *   here   hp-det-gpios  = <&gpio2 RK_PC6 GPIO_ACTIVE_HIGH>
+ *
+ * i2s1_2ch is already enabled by eeclone and the rk817 codec already carries
+ * #sound-dai-cells, so enabling the card is the only thing missing.
+ */
+&{/rk817-sound-amplified} {
+	status = "okay";
+};
