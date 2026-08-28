@@ -1,341 +1,180 @@
-# RK915 WiFi on the Gusgu H7 — investigation and outcome
+# RK915 WiFi on the Gusgu H7
 
-*Session of 2026-08-26 / 27. Device: Gusgu H7 (Rockchip RK3326), ROCKNIX port on
-branch `gusgu-h7-port`, kernel 7.1.2, serial console `/dev/ttyUSB0` @ 1500000 8N1.*
+Investigation record for the RK915 SDIO WiFi chip on the Gusgu H7 (RK3326),
+running the ROCKNIX port on branch `gusgu-h7-port`, kernel 7.1.2.
 
-## Summary
+## State of play
 
-The RK915 firmware faults under load — bulk traffic trips it within seconds, and
-the driver also loses the same race against boot-time system load. The driver
-detects the fault and asks mac80211 to restart the hardware, but **recovery could
-never complete**, so every fault killed the link until the module was reloaded by
-hand.
+WiFi associates, gets a lease, and holds a stable MAC. Under **concurrent**
+traffic the chip still faults — but a fault is now a brief self-healing blip
+instead of a hard hang.
 
-The root cause was an `sdio_reset` latch: after the first io error, every SDIO
-accessor returned success *without doing any i/o*, so the firmware re-download
-that recovery depends on wrote into nothing. It was only ever cleared by
-`sdio_probe()` — which is precisely why a module reload was the one thing that
-worked. Fixed, along with two further bugs it was masking (vif accounting not
-reset across a hardware restart, and a racy fw-error claim).
-
-**The driver now recovers in place**: same interface, same DHCP lease, no module
-reload. Measured against a reproducer that kills the link in ~10 s: 23 recoveries,
-31 successful firmware downloads, 0 failures.
-
-The underlying fault still occurs; it is simply no longer fatal. A boot-time
-watchdog remains as a backstop but should now essentially never fire.
-
-Earlier sections below record hypotheses that were tested on hardware and
-**disproven** — a `udelay` in the chained-RX path, and a `debug_mask` bisect that
-did not replicate. They are kept because they document what the fault is *not*.
-
-## Root cause: the sdio_reset latch
-
-**Fixed.** `patches/rk915-0003-clear-sdio-reset-latch-on-power-cycle.patch`.
-
-`_sdio_reset()` latches a file-static flag on the first io error:
-
-```c
-static bool sdio_reset;
-int _sdio_reset(struct host_io_info *host) { sdio_reset = true; return 0; }
-```
-
-and every sdio accessor then short-circuits, **returning success without doing
-any i/o**:
-
-```c
-static int sdio_send_data(struct host_io_info *host, u32 addr, u8 *buf, u32 len)
-{
-        if (sdio_reset == true)
-                return 0;
-        return sdio_memcpy_toio(func, addr, buf, len);
-}
-```
-
-`rk915_io_reset()` calls it from six sites in `hal_io.c`, so *any* io error arms
-it, and nothing cleared it except `sdio_probe()` — a module (re)load.
-
-So firmware error recovery could never work. Recovery power-cycles the chip and
-re-downloads the firmware, but every write is a silent no-op reporting success.
-Per-block timing makes it unambiguous:
-
-| | block 0 | block 1 | total |
-|---|---|---|---|
-| failing download | `ret=0` in **2 µs** | `ret=0` in **5 µs** | 1649 µs |
-| working download | `ret=0` in 269 µs | `ret=0` in 247 µs | 4611 µs |
-
-4096 bytes in 2 µs is 2 GB/s — the bus cannot do that. Nothing was transferred,
-so the readback was all zeroes (`30550/48056 bytes differ, first at 0x0`), the
-chip never reached `WAIT_PATCH`, and mac80211 shut every interface down.
-
-This also explains the one thing that always worked: reloading the module runs
-`sdio_probe()`, which clears the latch.
-
-The fix drops the latch in `rk915_sdio_power_cycle()`, once the card has been
-reset, re-enabled and had its block size restored — the point at which i/o is
-valid again.
-
-### Two further bugs found on the way
-
-- **`patches/rk915-0004-reset-vif-accounting-on-hw-restart.patch`** — once
-  recovery started working, the *second* restart hit
-  `add_interface: Exceeded Maximum supported VIF's cur:2 max: 2`. mac80211
-  re-adds interfaces after a restart but never calls `remove_interface()` for the
-  old ones, and the accounting was only cleared by `rpu_init()` at module load.
-  Cleared in `start()` instead.
-- **`patches/rk915-0002-atomic-fw-error-claim.patch`** — `rk915_signal_io_error()`
-  claimed recovery with a plain test-then-set, so the rx and tx threads both got
-  through and `ieee80211_restart_hw()` was called twice, 163 µs apart. Now
-  `cmpxchg()`.
-
-### Result
-
-Measured on hardware with a reproducer that kills the link in ~10 s under inbound
-TCP (~0.1–0.5 MB):
-
-| Metric | Before | After |
+| | Before | Now |
 |---|---|---|
-| firmware downloads during recovery | always failed | **31 succeeded, 0 failed** |
-| recoveries completed | 0 | **23** |
-| `Exceeded Maximum VIF` | yes | **0** |
-| link after a fault | dead until module reload | **returns by itself** |
-| interface name / DHCP lease | changed on every reload | **unchanged** |
+| Fault under load | whole machine hangs, power cycle required | link drops, recovers itself |
+| SDIO interrupt storm | ~684,000/s, starves every interrupt on CPU0 | none |
+| Driver after a fault | tx/rx threads stuck in `D`, module unloadable | errors out, recovery runs |
+| Firmware recovery | never completed | 31 downloads, 0 failures |
+| MAC / DHCP lease | new random MAC every module load | stable, from vendor storage |
 
-The driver now recovers in place: same `phy`, same interface, same lease, no
-module reload. Under sustained load the fault re-triggers and the driver simply
-recovers again, with the backoff visible in the log (1.7 s → 2.0 → 2.9 → 3.6 →
-6.4 → 8.7 → 12.2 → 15.9 s).
+**Not fixed:** the chip stops responding after roughly 10–80 requests of
+concurrent traffic. Everything below documents what that is, what it is not, and
+how to reproduce it.
 
-### The TX-spin hard hang
+## Reproducer
 
-**Fixed separately, in the kernel:**
-`patches/linux/036-dw_mmc-dont-spin-on-a-dead-bus.patch`.
+Sequential requests never trigger it. **Concurrency is the trigger** — a browser
+does this naturally, which is why clicking a directory in the built-in web server
+reproduces it instantly:
 
-There is a second, harder failure: instead of the driver noticing the fault and
-recovering, `rk915_tx` wedges *inside* the SDIO write and never returns, so
-`rk915_signal_io_error()` is never called and the recovery above never runs.
-
-```
-CPU: 0 UID: 0 PID: 491 Comm: rk915_tx
-pc : dw_mci_start_command+0x58/0x120
-x19: 00000000ffffffff
-  sdio_memcpy_toio -> sdio_send_data [rk915] -> rk915_data_write
-  -> rpu_send_cmd_datas -> tx_thread [rk915]
-```
-
-`dw_mci_wait_while_busy()` polls `SDMMC_STATUS` with
-`readl_poll_timeout_atomic()` for up to 500 ms before every data command — no
-sleeping, `host->lock` held, interrupts disabled. When the chip falls off the bus
-the register reads all-ones (`x19`), so `SDMMC_STATUS_BUSY` is permanently set and
-every command burns the full 500 ms. The CPU stops servicing interrupts entirely:
-the display stalls waiting for vblank, the network dies, the joypad poll stops,
-and printk itself stops coming out. Only a power cycle recovers it.
-
-An all-ones read is not a valid status — it means the host is not answering.
-Break out of the poll and let the command time out normally so the error reaches
-the driver and the recovery path can do its job.
-
-Note this is why bulk transfers over WiFi are impractical *before* the fix: a
-24 MB scp to the device managed ~1.7 KB/s, because the link faulted and recovered
-roughly every 0.3 MB.
-
-### What is still not fixed
-
-The *underlying* fault still occurs — bulk traffic still trips
-`rk915_serias_read: length(61680) too long` or a tx write returning `-16`. What
-changed is that it is no longer fatal: recovery works, so it costs a brief blip
-instead of the link. Finding why the chip faults under load in the first place is
-a separate question, and the 0xF0F0 chained-header analysis below is where it
-starts.
-
-`system.d/rk915-recover.sh` is kept as a backstop but should now essentially
-never fire, since it triggers on
-`fw_bring_up: rk915_download_firmware failed`, which no longer happens.
-
-## The fault
-
-```
-rk915: rk915_serias_read: length(61680) too long error.
-rk915: -------- fw error recovery (0) start --------
-rk915: rx_thread: error datalen: 0.
+```python
+# 8 parallel keep-alive connections; dies within ~10s
+import threading, socket, base64
+auth = base64.b64encode(b"root:rocknix").decode()
+def worker(path):
+    while True:
+        s = socket.create_connection((IP, 80), timeout=8)
+        for _ in range(20):
+            s.sendall((f"GET {path} HTTP/1.1\r\nHost: {IP}\r\n"
+                       f"Authorization: Basic {auth}\r\n"
+                       "Connection: keep-alive\r\n\r\n").encode())
+            s.recv(65536)
+        s.close()
+for p in ["/roms/"]*6 + ["/", "/assets/"]:
+    threading.Thread(target=worker, args=(p,), daemon=True).start()
 ```
 
-Firmware recovery then fails, because by that point the chip is incoherent:
+## The fixes
+
+### Kernel — `patches/linux/036-dw_mmc-dont-spin-on-a-dead-bus.patch`
+
+**TXDR/RXDR storm.** These signal "the FIFO needs CPU servicing" and are only
+meaningful for PIO. `dw_mci_submit_data()` enables them on the PIO path and the
+DMA path does not — but the initial `INTMASK` enables them unconditionally and
+nothing turns them off, so they also fire throughout every DMA transfer where
+`host->sg` is NULL and the handler can only clear the latch. Harmless while DMA
+drains the FIFO; lethal when the card dies, because the condition then persists
+and the level-triggered line storms:
 
 ```
-rk915: 30550/48056 bytes differ, first at 0x0 (wrote 0x81 read 0x00)
-rk915: rk915_download: check downloaded fw failed
-rk915: fw_bring_up: rk915_download_firmware failed
+IRQTRACE 344 dwmci: 56:164736147  vop=11531 adc=24734 ser=418 gpio=10946
+IRQTRACE 345 dwmci: 56:165433415  vop=11531 adc=24734 ser=418 gpio=10946
 ```
 
-mac80211 tears the device down and the interface is left with no route. Management
-frames always worked — association and DHCP usually succeeded; the failure needed
-data traffic.
+~684,000 interrupts/second on `mmc@ff380000`, with every other interrupt frozen.
+All device interrupts on this board are affine to CPU0, so the VOP stops (drm
+vblank timeouts), the SARADC stops (joypad error spam) and the network dies.
+Fixed by masking them for the duration of a DMA transfer.
 
-61680 is **0xF0F0**. In `rk915_serias_read()` (`src/hal_io.c`) the length of the
-next packet in a chained RX burst is taken straight from the burst buffer:
-
-```c
-host->rx_serias_buf_curr += host->rx_serias_len[host->rx_serias_idx];
-++host->rx_serias_idx;
-mac_hdr = (struct host_rpu_msg_hdr *)host->rx_serias_buf_curr;
-host->rx_next_len = mac_hdr->length >> 16;      /* 0xF0F0____ >> 16 == 61680 */
-mac_hdr->length = mac_hdr->length & 0x0000FFFF;
-length = mac_hdr->length + mac_hdr->payload_length;
-```
-
-so a header that reads back as `0xF0F0____` yields exactly the observed value, and
-the bounds check a few lines later rejects it and takes the chip down.
-
-Failure timing was load-dependent, not a fixed timer: 4.15 s, 13.17 s and 29.4 s
-across runs, settling at a very repeatable ~29.4 s once the test conditions were
-stable.
-
-## What was ruled out
-
-Each of these was applied to hardware and observed, not reasoned about:
-
-| Hypothesis | Test | Result |
-|---|---|---|
-| LMAC sleeping mid-RX | `lpw_no_sleep=1` (patch 0001, verified applied via `modinfo`) | no effect |
-| Firmware feature bits | `rk915.patch_features=12`, verified via `/sys/module` and `/proc/cmdline` | no effect |
-| Missing settle before the chained header read | `rx_settle_us=200`, then `2000` (patch, built and loaded) | no effect — faulted at 29.39 s and 29.41 s |
-
-## The debug_mask lead, and why it did not survive
-
-The driver is a mainline port of a vendor BSP. Where the BSP logged
-unconditionally (`RPU_INFO_SDIO(...)`), the port gates the same calls on
-`debug_mask`, which defaults to 0. Booting with `rk915.debug_mask` set made the
-fault disappear, which suggested the port had silently removed delays the shipped
-code always carried.
-
-A bisect over the mask pointed at a single call site — `RK915_DBG_HALIO` is
-`BIT(18)` = `0x40000`, and it has **exactly one** occurrence in the whole driver,
-at `src/hal_io.c:228`, immediately after the reads above:
-
-- `0x150000` (HALIO|SDIO|RECOVERY) → 600/600 pings, 0% loss
-- `0x40000` (HALIO alone) → 600/600 pings, 0% loss
-- `0x10000` (SDIO alone) → failed
-
-That looked conclusive. **It did not replicate.** Re-tested this session, both
-`0x40000` and `0x150000` faulted, and with `0x150000` only 1 of 3 boots came up
-with a route. The original bisect was one run per arm against an intermittent
-fault, which is not enough evidence to support the conclusion it was given.
-
-The delay patch was built on that lead: an explicit, runtime-tunable `udelay()`
-in place of the incidental printk delay. It failed at both 200 µs and 2000 µs,
-which also rules out "the printk is just burning time" as the mechanism.
-
-A positive control — the same module with `debug_mask=0x40000` — *also* faulted,
-which showed the test harness itself was confounded: loading the driver late from
-a systemd unit (with `modprobe.blacklist=rk915` on the cmdline) changes boot
-concurrency enough to fire the fault regardless of logging. Nothing loaded that
-way can validate or invalidate a driver change, so that avenue was abandoned.
-
-## What actually holds
-
-The driver is stable once the system is idle. On a boot that had failed:
+**Write data timeout.** `dw_mci_set_drto()` was armed only for reads, so a write
+to a card that stops responding had no timeout at all and `mmc_wait_for_req()`
+waited forever:
 
 ```
-modprobe -r rk915 && modprobe rk915 && systemctl restart iwd
+task:rk915_tx  state:D
+  wait_for_completion / mmc_wait_for_req_done / mmc_io_rw_extended
+  / sdio_memcpy_toio / tx_thread [rk915]
+task:rk915_rx  state:D
+  __mmc_claim_host / sdio_claim_host / rk915_serias_read [rk915]
 ```
 
-restored a working link, and it stayed up:
+The rx thread is queued behind tx on the host lock, so nothing errors, recovery
+never runs, and the module cannot be unloaded. Armed for writes as well; the
+timeout comes from `TMOUT`, which is programmed per request from
+`data->timeout_ns`.
 
-| Test | Result |
+Also included: `dw_mci_wait_while_busy()` would burn its full 500 ms atomic poll
+on an all-ones `SDMMC_STATUS`, and `dw_mci_interrupt()` would service all 32 bits
+of an all-ones `MINTSTS`. Neither value is data.
+
+### Driver
+
+- **`rk915-0003-clear-sdio-reset-latch-on-power-cycle.patch`** — the root reason
+  recovery never worked. `_sdio_reset()` latches a file-static flag on the first
+  io error, after which every accessor returns success *without doing any i/o*.
+  Only `sdio_probe()` cleared it, which is why a module reload was the one thing
+  that ever helped. Per-block timing made it unambiguous: a failing download
+  "wrote" 4096 bytes in **2 µs** (2 GB/s) against 269 µs for the same block on a
+  working one. Cleared in `rk915_sdio_power_cycle()`.
+- **`rk915-0004-reset-vif-accounting-on-hw-restart.patch`** — mac80211 re-adds
+  interfaces after a restart but never calls `remove_interface()`, and the
+  accounting was only cleared at module load, so the second restart hit
+  `Exceeded Maximum supported VIF's cur:2 max: 2`.
+- **`rk915-0002-atomic-fw-error-claim.patch`** — `rk915_signal_io_error()` used a
+  plain test-then-set, so rx and tx both got through and
+  `ieee80211_restart_hw()` was called twice, 163 µs apart.
+
+### MAC address
+
+The port falls back to `eth_random_addr()` when the DT carries no MAC, so the
+interface came up with a new address and lease on every load. The BSP used
+`rockchip_wifi_mac_addr()`, reading the factory MAC from Rockchip vendor storage
+(tag `0x524B5644` at sector 7296, item id 3):
+
+```
+1e 28 78 e8 94 15   22 28 78 e8 94 15     wifi, then the derived P2P address
+```
+
+The vendor U-Boot already reads that and exports `ethaddr`/`eth1addr`, and its
+`fdt_fixup_ethernet()` writes `ethaddr` into whatever `/aliases/ethernet0`
+resolves to. Pointing that at the wifi node keeps the address **per device**
+rather than baking one unit's MAC into a shared DTS.
+
+### Console noise
+
+`rocknix-joypad` logged an unratelimited `dev_err` per poll (~8/s forever) when
+the SARADC stops answering — which it does as a side effect of the storm above.
+Now `dev_err_ratelimited()`.
+
+## What the remaining fault is not
+
+Every one of these was tested on hardware and eliminated:
+
+| Hypothesis | How it died |
 |---|---|
-| post-reload soak, `debug_mask=0` | 300/300 pings, 0% loss, `rx_errors=0`, 0 faults |
-| same with the delay patch disabled (`rx_settle_us=0`) | 300/300 pings, 0 faults |
-| post-reload soak, stock module | 396/400 pings (1% loss), 0 faults, 2.5 MB RX, route intact |
-| soak on a boot the recovery unit fixed by itself | **400/400 pings, 0% loss**, 0 faults, 3.19 MB RX, route intact |
+| Bus clock gating on idle | `CLKENA = 0x00000001` — `LOW_PWR` clear, quirk working |
+| Chip LMAC sleeping | `lpw_no_sleep=1`, wired to `rpu_sleep_type = LMAC_NO_SLEEP` |
+| `ALIGN(buf_len, 4)` length padding | present in the pristine BSP; all padded transfers return 0 |
+| TX descriptor not atomic against RX | held the host lock across the whole descriptor — still died |
+| Access during radio retune | added the RX path's guard to TX — still died |
+| cpuidle / deep idle states | `cpuidle.off=1` changed nothing |
+| Tickless idle | `nohz=off` changed nothing |
+| A newer upstream fix | `stolen/rk915` main has nothing since 2025-07-08 |
+| `debug_mask` timing (early theory) | did not replicate; that bisect was one run per arm |
+| A `udelay()` in the chained-RX path | no effect at 200 µs or 2000 µs |
+| Removing `cap-sdio-irq` | breaks wifi entirely — the core falls back to a polling SDIO irq thread whose CMD52s collide with the driver |
 
-Note the second row: with the system idle the fault does not reproduce *either
-way*, which is why the driver patch could not be validated — and why the same
-result should not be read as the patch working.
+## What is known about the fault
 
-## The shipped fix
-
-`projects/ROCKNIX/packages/linux-drivers/rk915/system.d/rk915-recover.service`,
-installed and enabled by the rk915 package:
-
-It waits 30 s, then reloads `rk915` and restarts `iwd` **only if the driver
-logged a fault**:
-
-```sh
-FAULTS='rk915: .*(too long error|fw error recovery|No reset complete|check downloaded fw failed|rk915_download_firmware failed)'
-dmesg | grep -qE "$FAULTS" || exit 0        # healthy - leave it alone
-modprobe -r rk915; sleep 3; modprobe rk915; sleep 10; systemctl restart iwd
-```
-
-The trigger is the kernel log, **not** connectivity. An earlier version keyed on
-"no default route", which is wrong: with WiFi unconfigured, out of range, or
-simply unused there is no route and no fault, so it reloaded the driver on every
-boot — churning `iwd` while the user was trying to configure WiFi, and renaming
-`wlan0` to `wlan1` where the UI can see it.
-
-`rx_thread: error datalen: 0` is deliberately excluded from the trigger: it is
-also seen once on a healthy interface bring-up, so it is not decisive alone.
-`RPUWIFI-UMAC: No reset complete after 900 ticks` **is** included — it is the
-same race failing earlier, during chip reset.
-
-Validation, three consecutive boots:
-
-| Boot | default route | unit log |
-|---|---|---|
-| 1 | yes | (no action needed) |
-| 2 | yes | `recovered` |
-| 3 | yes | `recovered` |
-
-### Do not put `debug_mask` on the cmdline
-
-`rk915.patch_features=12 rk915.debug_mask=0x150000` were initially left on the
-cmdline because that was the combination the 3/3 validation ran against. That was
-a mistake, and it bit on the first boot where WiFi carried real traffic.
-
-The HALIO site logs **once per packet** in every chained RX burst. At 1.5 Mbaud a
-~40-character line is ~267 µs of blocking console write, so a busy link saturates
-the console: vblank handling misses its deadline
-(`[CRTC:39:crtc-0] vblank wait timed out` in `drm_atomic_helper_wait_for_vblanks`),
-RCU stalls, `systemd-journal` spins eating the flood, load average hits 6.7 and
-the device freezes. Every soak before that point was pings at 1/s, a rate that
-never exercises the logging path — the parameter was validated under a traffic
-profile that could not reveal its cost.
-
-Both parameters are now removed. Re-measured without them, at 10× the packet rate:
-
-| Metric | Result |
-|---|---|
-| ping | 1991/2000, 0.45% loss, 3.24 MB RX |
-| vblank timeouts / RCU stalls | 0 / 0 |
-| driver faults | 0 |
-| `rk915:` lines in dmesg | 3 (version + firmware) |
-| load average | 0.71 |
-
-WiFi associates and holds a lease with `debug_mask` unset, which is further
-evidence the parameter never did anything for the RX race.
-
-## Honest status
-
-- WiFi is **usable**: it comes up on every boot, recovering itself when needed.
-- The underlying race in `rk915_serias_read()` is **not fixed**. The corrupt
-  `0xF0F0` header read is understood as a symptom; the mechanism that lets a
-  stale header be observed is not.
-- The one-line delay hypothesis is disproven. Something other than elapsed time
-  distinguishes the printk from a busy-wait — a lock, a barrier, preemption, or
-  the interrupt window it opens. That is where a future attempt should start.
-- The failure rate without the recovery unit was measured at 2 of 3 boots on this
-  unit, on this AP, on one night. Treat it as an order of magnitude, not a constant.
-- **Sustained TX hard-freezes the device** and needs a power cycle. This is the
-  most serious open problem in the port; see the limitation section above. The
-  recovery unit does not help — it runs once, at boot.
-
-## Reproducing the fault
-
-Fastest reproducer is simply a cold boot with the recovery unit masked:
+With an in-driver ring recording the last transfers, the failure looks like this:
 
 ```
-systemctl mask rk915-recover.service && reboot
-# then, from the serial debug shell:
-dmesg | grep -E 'too long|fw error recovery'
-ip route | grep default || echo "link is down"
+RKTRACE -348497us wr addr=0 len=1542 ret=0     writes every ~118us
+RKTRACE -348380us wr addr=0 len=1542 ret=0     last activity
+RKTRACE     -59us wr addr=0 len=1542 ret=-110  348ms later, ETIMEDOUT
 ```
+
+The chip does not die *during* a transfer. It goes silent while the data path is
+idle — no data reads or writes for ~348 ms — and the next write times out. The
+host-wake GPIO stops at the same time, which is the driver's only RX wake source,
+so nothing notices until a write fails.
+
+Note the trace covers data transfers only; CMD52 register access is not recorded,
+so "the driver did nothing" is not established — only that no data moved.
+
+## Where a fix should start
+
+This is a firmware/protocol-level fault in a WIP mainline port of a vendor
+driver, and chasing it further needs the chip documentation the porter has and
+this investigation does not. The evidence worth handing upstream is in
+`RK915-UPSTREAM-REPORT.md`.
+
+## Method note
+
+Four hypotheses about the interrupt storm were wrong before the register dump
+settled it in one cycle: an all-ones `MINTSTS`, the SDIO in-band bit, abnormal
+IDMAC bits, and masking on first occurrence. The measurements that actually moved
+this forward were `/proc/interrupts` traced to the console once a second,
+`sysrq-w` for blocked-task stacks, a register dump every 200000th interrupt, and
+an in-driver transfer ring. Reading the code suggested plausible answers; only
+measuring distinguished them.

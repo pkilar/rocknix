@@ -330,13 +330,12 @@ the parameter. Costs idle power; the proper fix is to restore the wake path.
 
 ### WiFi works, via a recovery unit
 
-> **WiFi recovers itself.** Bulk traffic can still trip a firmware fault in the
-> RK915, but the driver now recovers in place — same interface, same lease, no
-> module reload. Three driver bugs were fixed to get there, the root one being an
-> `sdio_reset` latch that made every SDIO write a silent no-op after the first io
-> error, so firmware re-download during recovery wrote into nothing. Measured:
-> 23 recoveries, 31 successful downloads, 0 failures. Full analysis:
-> **`RK915-WIFI.md`**.
+> **WiFi works, with one known limit.** It associates, holds a lease and keeps a
+> stable MAC. Under *concurrent* traffic the chip still faults, but a fault is now
+> a self-healing blip rather than a hard hang: several dw_mmc and driver bugs that
+> turned it into a machine-wide lockup are fixed, and the driver's own firmware
+> recovery now completes. Full record in **`RK915-WIFI.md`**; the outstanding
+> chip-level fault is written up for upstream in **`RK915-UPSTREAM-REPORT.md`**.
 
 The driver loses a race against boot-time system load and comes up with a dead
 link roughly **two boots in three**: it associates and usually gets a DHCP lease,
