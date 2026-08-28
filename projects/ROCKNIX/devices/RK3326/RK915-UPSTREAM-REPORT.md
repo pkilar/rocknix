@@ -8,11 +8,79 @@ My device tree matches `docs/mainline-linux-dts-example.dtsi` property for
 property, differing only in the host-wake pin (`RK_PA1` on this board rather than
 `RK_PA5`), and my copy of the quirks patch is byte-identical to yours.
 
-The README lists two known issues. **The second one has a fix below.** The first
-one I could not solve, but I can offer a deterministic reproducer, a list of what
-it is not — and a correction to how it is described: the chip does not drift off
-the network after association, it dies on the first few hundred KB of sustained
-traffic.
+**Both known issues have fixes below**, along with three further bugs I hit on
+the way. Both README descriptions were accurate — I reproduced each one exactly
+as written.
+
+One problem is left that I could not solve, and it is *not* either known issue:
+with issue 1 fixed the link is stable indefinitely, but a few hundred KB of
+sustained traffic still kills it. Reproducer and a list of dead ends at the end.
+
+---
+
+## Known issue 1: "Soon after association chip disconnects from network"
+
+Reproduced exactly as described, root-caused, fixed.
+
+First hardware test associated successfully and died ~4 s later:
+
+```
+rk915: rk915_serias_read: length(61680) too long error.
+```
+
+61680 is 0xF0F0 — both CMD52 byte reads in `rk915_read_data_len()` came back
+0xF0. Firmware recovery then failed (`30550/48056 bytes differ, first at 0x0`)
+because SDIO was already incoherent, and mac80211 tore the device down.
+
+Not an integration fault on my side: the card node's `compatible =
+"rockchip,rk915"` binds and `mmc_fixup_of_compatible_match()` scans exactly those
+nodes, so the quirks match; `CLKENA = 0x1` confirms the clock is ungated; the bus
+runs at the stock 50 MHz / 4-bit / SD-high-speed / 3.3 V.
+
+**The port dropped the BSP's wake path.** Diffing against `docs/0001-rk915.patch`:
+`hal.c` is 883 lines here against the BSP's 1971, and the deletions include
+`trigger_wakeup()`, `check_and_wakeup_rpu_nonblocking()`, `get_rpu_sleep_status()`
+and `trigger_timed_sleep()`. The BSP wakes the chip before touching it over SDIO
+(`hal.c:809`). The port removed that path, kept telling the firmware it may
+sleep, and also dropped the module_param that could have disabled sleeping:
+
+```c
+BSP:  unsigned int lpw_no_sleep = 0;  module_param(lpw_no_sleep, int, 0);
+port: unsigned int lpw_no_sleep;
+```
+
+So the chip sleeps at the first idle moment after association — which is exactly
+why association itself succeeds, since it keeps the chip busy — and nothing ever
+wakes it. That is the defect the README describes.
+
+**This is a compensating fix, not the proper one.** The proper fix is to restore
+the wake path; this just stops the chip sleeping in the first place. It costs
+idle power. The parameter comes back so it can be switched off once a wake path
+exists:
+
+```diff
+--- a/src/procfs.c	2026-08-26 21:59:06.219423215 -0400
++++ b/src/procfs.c	2026-08-26 21:59:06.234497545 -0400
+@@ -12,7 +12,14 @@
+ #include "hal_io.h"
+ #include "if_io.h"
+ 
+-unsigned int lpw_no_sleep;
++/*
++ * Must stay 1 while the driver has no wake path: letting the LMAC sleep
++ * leaves CMD52 reads returning 0xF0F0 once the link goes idle.
++ */
++unsigned int lpw_no_sleep = 1;
++module_param(lpw_no_sleep, uint, 0444);
++MODULE_PARM_DESC(lpw_no_sleep,
++		 "keep the LMAC permanently awake (default 1; 0 needs a wake path)");
+ 
+ unsigned int default_phy_threshold = DAPT_DEFAULT_PHY_THRESH;
+ 
+```
+
+With this in place the link has held for nearly 13 hours continuously, idle and
+under light traffic, with no disconnect.
 
 ---
 
@@ -176,6 +244,7 @@ Masking them for the duration of a DMA transfer fixes it:
  		if (pending & SDMMC_INT_CMD_DONE) {
 ```
 
+
 ---
 
 ## Bug: the `sdio_reset` latch makes firmware recovery a silent no-op
@@ -324,19 +393,16 @@ apart:
  
 ```
 
+
 ---
 
-## Known issue 1 — the description does not match what I see
+## Remaining problem: the link dies on sustained traffic
 
-The README says *"Soon after association chip disconnects from network"*. That is
-not what happens on my hardware, and the difference matters for anyone trying to
-reproduce it.
+This one is unsolved, and I want to be clear that it is **not** known issue 1
+resurfacing — with `lpw_no_sleep=1` the association is stable indefinitely, and
+this failure is triggered by data volume, not by elapsed time.
 
-**The association is stable.** This device has held its link for nearly 13 hours
-continuously, idle and under light traffic, with no disconnect. Time since
-association is not the variable.
-
-**Sustained traffic kills it, in well under a megabyte.** Three runs pushing a
+**It dies in well under a megabyte.** Three runs pushing a
 single TCP stream at a `nc` sink died after 0.20 MB, 0.46 MB and 0.79 MB, each
 within ~10 s of starting. Eight parallel keep-alive HTTP connections die just as
 reliably, after 10–80 requests. By contrast, 35 sequential HTTP bursts of ~49 KB
@@ -344,10 +410,8 @@ each with a 12 s idle gap between them ran clean start to finish.
 
 So it is not concurrency as such — one connection is enough — and it is not time
 since association. It is the volume of data moved without a pause. Concurrency
-only matters because it is the easy way to generate that volume, which is
-probably why this reads as "disconnects soon after association": the first thing
-anyone does after associating is open a browser, and a directory listing is
-enough to cross the threshold.
+only matters because it is the easy way to generate that volume: a browser
+loading a directory listing is more than sufficient.
 
 Minimal form — one stream, no HTTP, no concurrency. On any machine on the same
 LAN, then on the device:
@@ -393,7 +457,7 @@ The ring records data transfers only, not CMD52.
 | Hypothesis | Result |
 |---|---|
 | Bus clock gating | `CLKENA = 0x00000001`, `LOW_PWR` clear — `MMC_QUIRK_SDIO_CONT_CLOCK` working |
-| LMAC sleep | `lpw_no_sleep=1` reaching `rpu_sleep_type = LMAC_NO_SLEEP` |
+| LMAC sleep (i.e. known issue 1) | already fixed above; verified `lpw_no_sleep=1` reaches `rpu_sleep_type = LMAC_NO_SLEEP`, so this is a different failure |
 | `ALIGN(buf_len, 4)` padding | also in the BSP import; every padded transfer returns 0 |
 | TX descriptor atomicity | `rpu_send_cmd_datas()` claims/releases per frame so rx can interleave; holding the host across the descriptor did not help |
 | Radio-retune window | added `rk915_serias_read()`'s guard to the tx path; did not help |
@@ -404,6 +468,7 @@ The ring records data transfers only, not CMD52.
 If there is a documented handshake for the host-wake line, or a flow-control or
 buffer-credit rule around `num_frames_per_desc`, that is where I would look
 next — the hardware datasheet in `docs/` is electrical only.
+
 
 ## Aside: MAC address
 
@@ -426,6 +491,7 @@ aliases {
 Verified: the node comes up carrying `local-mac-address = 1e 28 78 e8 94 15`
 written by U-Boot, and `of_get_mac_address()` picks it up. Might be worth a line
 in the README, since the binding already documents both MAC properties.
+
 
 ---
 
