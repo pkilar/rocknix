@@ -1,0 +1,13 @@
+[Unit]
+Description=rk915 WiFi watchdog (reload the driver when firmware recovery fails)
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+ExecStart=/usr/lib/rk915/rk915-recover.sh
+
+[Install]
+WantedBy=multi-user.target

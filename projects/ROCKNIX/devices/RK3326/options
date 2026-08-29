@@ -59,7 +59,7 @@
   # for a list of additional drivers see packages/linux-drivers
   # Space separated list is supported,
   # e.g. ADDITIONAL_DRIVERS="DRIVER1 DRIVER2"
-    ADDITIONAL_DRIVERS="mali-bifrost"
+    ADDITIONAL_DRIVERS="mali-bifrost rk915"
 
   # Additional Firmware to use ( )
   # Space separated list is supported,
@@ -67,7 +67,7 @@
     FIRMWARE="esp8089-firmware"
   
   # Additional packages to install
-    ADDITIONAL_PACKAGES="device-switch libmali generic-dsi"
+    ADDITIONAL_PACKAGES="device-switch libmali generic-dsi h7-rgb-leds"
     ADDITIONAL_PACKAGES_32BIT="libmali"
 
   # Debug tty path
