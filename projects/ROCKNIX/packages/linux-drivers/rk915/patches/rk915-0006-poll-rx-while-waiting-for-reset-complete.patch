@@ -1,0 +1,50 @@
+rk915: poll the rx path while waiting for RESET_COMPLETE
+
+The "No reset complete after N ticks" boot failure is intermittent, and
+wait_for_reset_complete() was a bare wait_event_timeout(): the completion
+only arrives via the rx thread, which only runs when the host-wake line
+fires, so one missed edge right after the download costs the whole
+timeout. Kick the rx thread every 100ms while waiting so it polls the
+chip for the pending event. A firmware that never answers still times
+out identically.
+
+The same structure, with the same reasoning, is in the independent
+sv6160 driver ("Poll the RX worker manually since SDIO interrupts may
+not be firing during early init").
+
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -131,7 +131,32 @@
+ 	else
+ 		timeout = msecs_to_jiffies(3000);
+ 
+-	wait_event_timeout(priv->hal->wait_q, priv->reset_complete, timeout);
++	if (enable) {
++		/*
++		 * RESET_COMPLETE only reaches us through the rx thread, and
++		 * the rx thread only runs when the host-wake line fires. A
++		 * single missed edge during early init - the line is
++		 * level-triggered and the irq has just been re-enabled after
++		 * the download - otherwise costs the whole timeout and shows
++		 * up as "No reset complete after N ticks" on some boots.
++		 *
++		 * So do not just sleep on it: kick the rx thread every 100ms
++		 * so it goes and looks. A firmware that really never answers
++		 * still times out here exactly as before.
++		 */
++		unsigned long deadline = jiffies + timeout;
++		unsigned long slice = msecs_to_jiffies(100);
++
++		while (!priv->reset_complete &&
++		       time_before(jiffies, deadline)) {
++			hal_irq_handler(priv->hal);
++			wait_event_timeout(priv->hal->wait_q,
++					   priv->reset_complete, slice);
++		}
++	} else {
++		wait_event_timeout(priv->hal->wait_q, priv->reset_complete,
++				   timeout);
++	}
+ 
+ 	if (!priv->reset_complete) {
+ 		rk915_err("%s-UMAC: No reset complete after %d ticks\n",

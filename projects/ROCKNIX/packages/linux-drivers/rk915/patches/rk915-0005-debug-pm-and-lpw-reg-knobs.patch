@@ -1,0 +1,56 @@
+rk915: procfs knobs for the PM notify and LPW register access
+
+
+--- a/src/procfs.c
++++ b/src/procfs.c
+@@ -800,6 +800,50 @@
+ 	else if (strstr(buf, "simulate_fw_crash"))
+ 		/* exercise the mac80211-restart recovery path */
+ 		rk915_signal_io_error(wifi->hal, FW_ERR_SDIO);
++	else if (param_get_val(buf, "econ_ps=", &val))
++		/* firmware power-save state: 1 = awake, 0 = doze. The driver
++		 * never sets this at all; the chip runs at whatever it boots
++		 * with. Lets that be varied by hand. */
++		rpu_prog_econ_ps_state(0, val);
++	else if (param_get_val(buf, "notify_pm=", &val))
++		/*
++		 * The one host->chip wake the hardware has: a CMD52 write of
++		 * IO_NOTIFY_WAKEUP (1) or IO_NOTIFY_SLEEP (0) to the notify
++		 * register. The driver only ever sends it around suspend and
++		 * init; this lets it be sent by hand while a fault is live.
++		 */
++		rk915_notify_pm(wifi->hal, !!val);
++	else if (!strncmp(buf, "write_lpw_reg=", 14) ||
++		 !strncmp(buf, "write_fw_reg=", 13) ||
++		 !strncmp(buf, "read_lpw_reg=", 13) ||
++		 !strncmp(buf, "read_fw_reg=", 12)) {
++		/*
++		 * Register access through the firmware (DUMP_REG_INFO), as
++		 * the BSP's procfs exposed it. read_* results land in the
++		 * fw_info file. LPW is the chip's low-power block; the
++		 * clock-gating and sleep controls live there.
++		 */
++		struct fw_reg_info reg = { .len = 4 };
++		int lpw = strstr(buf, "lpw") != NULL;
++		int wr  = buf[0] == 'w';
++		const char *arg = strchr(buf, '=') + 1;
++		unsigned int a = 0, v = 0;
++
++		if (wr) {
++			if (sscanf(arg, "%i,%i", &a, &v) != 2)
++				return -EINVAL;
++			reg.val = v;
++		} else if (sscanf(arg, "%i", &a) != 1) {
++			return -EINVAL;
++		}
++		reg.reg = a;
++		reg.rw = wr ? (lpw ? WRITE_REG_LPW : WRITE_REG)
++			    : (lpw ? READ_REG_LPW  : READ_REG);
++		rk915_info("%s %s reg 0x%x val 0x%x\n", wr ? "write" : "read",
++			   lpw ? "lpw" : "fw", a, v);
++		if (rpu_fw_priv_cmd_sync(DUMP_REG_INFO, &reg) != 0)
++			return -EIO;
++	}
+ 	else
+ 		return -EINVAL;
+ 
