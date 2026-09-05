@@ -188,21 +188,50 @@ Every one of these was tested on hardware and eliminated:
 
 ## What is known about the fault
 
-With an in-driver ring recording the last transfers, the failure looks like this:
+The mechanism was pinned down on hardware in Sep 2026, after cross-referencing
+the independent `aenertia/sv6160-rk915` driver and the Seekwave firmware
+reverse-engineering (the RK915 is a rebranded Seekwave SV6160). A run of
+experiments, each with the firmware-state register polled at 5 Hz through a bulk
+transfer:
 
-```
-RKTRACE -348497us wr addr=0 len=1542 ret=0     writes every ~118us
-RKTRACE -348380us wr addr=0 len=1542 ret=0     last activity
-RKTRACE     -59us wr addr=0 len=1542 ret=-110  348ms later, ETIMEDOUT
-```
+* **The chip is not asleep.** `fw state` (SDIO reg 64) reads `5` (M0_READY)
+  before, during and after the fault. The earlier "goes quiet while idle"
+  reading was the *recovery* cycle seen from outside — with recovery now
+  working, the chip faults, reloads and faults again, and the quiet windows are
+  the reloads, not sleep. The whole "no host-side wake path" framing is moot:
+  the chip never sleeps under this load.
 
-The chip does not die *during* a transfer. It goes silent while the data path is
-idle — no data reads or writes for ~348 ms — and the next write times out. The
-host-wake GPIO stops at the same time, which is the driver's only RX wake source,
-so nothing notices until a write fails.
+* **It is not the power-save command.** Every recovery in the transfer window
+  opens with a small CMD53 *write* returning `-16`, and `RPU_CMD_CFG_PWRMGMT`
+  (mac80211 re-applying PS state) was the most frequent writer. But turning
+  mac80211 power save **off** changed nothing — the writes still failed. The
+  DAPT PHY-threshold timer (`RPU_CMD_UPD_PHY_THRESH`, ~2 s cadence) and block-ack
+  setup write into the same window.
 
-Note the trace covers data transfers only; CMD52 register access is not recorded,
-so "the driver did nothing" is not established — only that no data moved.
+* **The whole SDIO link wedges, not one command.** Instrumented to read RECV_LEN
+  and `fw_state` at the moment a write finally fails: **both reads also return
+  `-16`.** So it is not that a particular write is rejected — every SDIO
+  transaction to the card, CMD52 read and CMD53 write alike, returns `-EBUSY`
+  at once. The card stops servicing the bus entirely.
+
+* **Retrying host-side does not help.** A patch that retried a busy write up to
+  8 times (~30 ms), dropping the host lock between attempts so the rx thread
+  could drain, rescued **zero** writes across a full run. Once the wedge starts
+  it persists until the driver power-cycles the chip in recovery. (Patch
+  retracted; kept in the session's `scratch/falsified/`.)
+
+So the fault is a **chip-side SDIO wedge under sustained RX**: the card's SDIO
+slave stops responding to the bus — most consistent with its RX buffer pool
+filling faster than it can hand frames up (the SV6160 RE notes a 15-entry
+`rx_buf_pool`) — and only a full power cycle clears it. That is exactly why the
+link survives below ~15–29 KB/s and dies above it: the threshold is the rate at
+which the chip's buffers outrun its bus service.
+
+Ruled out as fixes, each on hardware: LMAC sleep (fw stays M0_READY);
+`lpw_no_sleep`/wake-notify (chip not asleep); mac80211 PS off; a runtime
+`LPW_CTRL` clock-gating write (the firmware register-write path does not reach
+that block — readback unchanged); a busy-write retry (wedge persists); a
+length-read retry (the 0xF0F0 was reload cycles, not CMD52 corruption).
 
 ## Where a fix should start
 
@@ -253,6 +282,33 @@ diff body to theirs, so nothing in their instructions is missing.
 driver fixes, the dw_mmc patch for their `docs/`, and the full write-up as the PR
 description. Local copy in `RK915-UPSTREAM-REPORT.md`.
 
+## Update (Sep 2026): boot race fixed, throughput fault diagnosed
+
+**Boot race — fixed.** `rk915-0006-poll-rx-while-waiting-for-reset-complete.patch`.
+`wait_for_reset_complete()` was a bare `wait_event_timeout()`; RESET_COMPLETE only
+arrives via the rx thread, which only runs when the host-wake line fires, so a
+single missed edge right after the firmware download cost the whole timeout and
+showed as "No reset complete after N ticks". The fix kicks the rx thread every
+100 ms while waiting so it polls the chip for the pending event. Straight from
+the `aenertia/sv6160` driver, which does the same with the same reasoning. A
+dead firmware still times out identically.
+
+**Throughput fault — diagnosed, not fixed.** See "What is known" above: it is a
+chip-side SDIO wedge under sustained RX, all transactions returning -EBUSY until
+a power cycle, consistent with RX-buffer exhaustion. A real fix needs the chip's
+RX flow-control / buffer-credit protocol, which is not in any documentation we
+have (the SV6160 RE names a 15-entry `rx_buf_pool` and an `event_pending_count`
+register but not the credit handshake). Directions, in order of promise:
+
+1. **RX pacing / flow control.** Keep the chip's RX buffers from overrunning —
+   either honour a credit the firmware exposes (not yet located) or cap the
+   negotiated RX rate. Rate-limiting is the proven workaround (`--bwlimit=15`);
+   it works precisely because it holds the chip under the wedge threshold.
+2. **Faster RX drain.** The wedge is the chip waiting on the host to take frames;
+   a higher-priority / lower-latency rx path might raise the threshold. Unproven.
+3. **`rx_bundle` / aggregation depth.** The SV6160 driver exposes an RX bundle
+   size (default 16); a smaller bundle trades throughput for headroom. Untested
+   here.
 ## Method note
 
 Four hypotheses about the interrupt storm were wrong before the register dump
