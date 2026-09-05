@@ -3,7 +3,7 @@ rk915: procfs knobs for the PM notify and LPW register access
 
 --- a/src/procfs.c
 +++ b/src/procfs.c
-@@ -800,6 +800,50 @@
+@@ -800,6 +800,58 @@
  	else if (strstr(buf, "simulate_fw_crash"))
  		/* exercise the mac80211-restart recovery path */
  		rk915_signal_io_error(wifi->hal, FW_ERR_SDIO);
@@ -48,8 +48,16 @@ rk915: procfs knobs for the PM notify and LPW register access
 +			    : (lpw ? READ_REG_LPW  : READ_REG);
 +		rk915_info("%s %s reg 0x%x val 0x%x\n", wr ? "write" : "read",
 +			   lpw ? "lpw" : "fw", a, v);
-+		if (rpu_fw_priv_cmd_sync(DUMP_REG_INFO, &reg) != 0)
++		/* Writes get no completion event from the firmware, so the
++		 * synchronous variant times out on them; the BSP issued these
++		 * asynchronously. Reads do complete (the data comes back as
++		 * an event that fills fw_info). */
++		if (wr) {
++			if (rpu_fw_priv_cmd(DUMP_REG_INFO, &reg) != 0)
++				return -EIO;
++		} else if (rpu_fw_priv_cmd_sync(DUMP_REG_INFO, &reg) != 0) {
 +			return -EIO;
++		}
 +	}
  	else
  		return -EINVAL;
