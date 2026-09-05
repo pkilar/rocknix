@@ -59,24 +59,19 @@ save-before/restore-after half is applicable.
 Confirmed fixing the post-resume cpufreq-transition crash on real
 hardware (kernel 6.12.79).
 
-Rebased for the kernel 6.12 -> 7.1.2 migration: upstream reworked the
-generic syscore_ops mechanism (drivers/base/syscore.c /
-include/linux/syscore_ops.h) - callbacks now take a `void *data`
-argument instead of `void`, registration no longer embeds a list_head
-directly in `struct syscore_ops` but instead wraps it in a separate
-`struct syscore { struct list_head node; const struct syscore_ops
-*ops; void *data; }`, and `register_syscore_ops()` was replaced by
-`register_syscore(struct syscore *)`. clk-rk3288.c in this same
-kernel tree was already updated upstream to the new API
-(rk3288_clk_suspend/rk3288_clk_resume taking `void *data`, a static
-`struct syscore rk3288_clk_syscore = { .ops = &rk3288_clk_syscore_ops
-}`, and `register_syscore(&rk3288_clk_syscore)`) - this rebase follows
-that exact pattern, no logic changes.
+Written against the classic syscore_ops API used by mainline 6.18:
+register_syscore_ops(struct syscore_ops *) with int (*suspend)(void)
+and void (*resume)(void) callbacks. This mirrors clk-rk3288.c in the
+same 6.18 tree exactly - rk3288_clk_suspend()/rk3288_clk_resume(), a
+static (non-const) struct syscore_ops rk3288_clk_syscore_ops, and
+register_syscore_ops(&rk3288_clk_syscore_ops) - no logic changes.
+(An earlier revision of this patch targeted the 7.1 register_syscore()
+wrapper API; 6.18 predates that rework, so the classic call is used.)
 
 ---
 --- a/drivers/clk/rockchip/clk-px30.c
 +++ b/drivers/clk/rockchip/clk-px30.c
-@@ -999,6 +999,55 @@
+@@ -999,6 +999,51 @@
  	"pclk_usb_grf",
  };
  
@@ -97,7 +92,7 @@ that exact pattern, no logic changes.
 +
 +static u32 px30_saved_cru_regs[ARRAY_SIZE(px30_saved_cru_reg_ids)];
 +
-+static int px30_clk_suspend(void *data)
++static int px30_clk_suspend(void)
 +{
 +	int i, reg_id;
 +
@@ -109,7 +104,7 @@ that exact pattern, no logic changes.
 +	return 0;
 +}
 +
-+static void px30_clk_resume(void *data)
++static void px30_clk_resume(void)
 +{
 +	int i, reg_id;
 +
@@ -120,13 +115,9 @@ that exact pattern, no logic changes.
 +	}
 +}
 +
-+static const struct syscore_ops px30_clk_syscore_ops = {
++static struct syscore_ops px30_clk_syscore_ops = {
 +	.suspend = px30_clk_suspend,
 +	.resume = px30_clk_resume,
-+};
-+
-+static struct syscore px30_clk_syscore = {
-+	.ops = &px30_clk_syscore_ops,
 +};
 +
  static void __init px30_clk_init(struct device_node *np)
@@ -144,7 +135,7 @@ that exact pattern, no logic changes.
  
  	rockchip_register_restart_notifier(ctx, PX30_GLB_SRST_FST, NULL);
  
-+	register_syscore(&px30_clk_syscore);
++	register_syscore_ops(&px30_clk_syscore_ops);
 +
  	rockchip_clk_of_add_provider(np, ctx);
  }

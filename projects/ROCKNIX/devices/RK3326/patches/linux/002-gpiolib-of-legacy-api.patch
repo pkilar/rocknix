@@ -1,0 +1,121 @@
+gpiolib: of: restore the legacy of_get_named_gpio_flags() API for rocknix-joypad
+
+Mainline dropped the int-returning of_get_named_gpio_flags()/of_get_gpio_flags()
+helpers, but the rocknix-joypad drivers (odroidgo2/-v11, odroidgo3, rgb20s,
+gameforce, xu10) still call of_get_gpio_flags(). 6.18 keeps the internal
+of_get_named_gpiod_flags(), so re-export a thin int-returning wrapper on top of
+it and add a self-contained <linux/of_gpio_legacy.h> for the drivers to include.
+
+The enum of_gpio_flags definition moves out of gpiolib-of.c into that header so
+both gpiolib-of.c (which now includes it, giving the wrapper a visible
+prototype - no -Wmissing-prototypes warning) and the joypad drivers share one
+definition. The header has its own include guard so it composes with the native
+<linux/of_gpio.h>.
+
+--- a/drivers/gpio/gpiolib-of.c
++++ b/drivers/gpio/gpiolib-of.c
+@@ -15,6 +15,7 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_gpio.h>
++#include <linux/of_gpio_legacy.h>
+ #include <linux/pinctrl/pinctrl.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+@@ -25,21 +26,6 @@
+ #include "gpiolib.h"
+ #include "gpiolib-of.h"
+ 
+-/*
+- * This is Linux-specific flags. By default controllers' and Linux' mapping
+- * match, but GPIO controllers are free to translate their own flags to
+- * Linux-specific in their .xlate callback. Though, 1:1 mapping is recommended.
+- */
+-enum of_gpio_flags {
+-	OF_GPIO_ACTIVE_LOW = 0x1,
+-	OF_GPIO_SINGLE_ENDED = 0x2,
+-	OF_GPIO_OPEN_DRAIN = 0x4,
+-	OF_GPIO_TRANSITORY = 0x8,
+-	OF_GPIO_PULL_UP = 0x10,
+-	OF_GPIO_PULL_DOWN = 0x20,
+-	OF_GPIO_PULL_DISABLE = 0x40,
+-};
+-
+ /**
+  * of_gpio_named_count() - Count GPIOs for a device
+  * @np:		device node to count GPIOs for
+@@ -472,6 +458,24 @@
+ }
+ EXPORT_SYMBOL_GPL(of_get_named_gpio);
+ 
++/*
++ * of_get_named_gpio_flags() - legacy int-returning variant that also reports
++ * the OF flags. Removed from the public GPIO API before 6.18 but still needed
++ * by the rocknix-joypad drivers; declared in <linux/of_gpio_legacy.h> and
++ * layered on the still-present internal of_get_named_gpiod_flags().
++ */
++int of_get_named_gpio_flags(const struct device_node *np, const char *list_name,
++			    int index, enum of_gpio_flags *flags)
++{
++	struct gpio_desc *desc;
++
++	desc = of_get_named_gpiod_flags(np, list_name, index, flags);
++	if (IS_ERR(desc))
++		return PTR_ERR(desc);
++	return desc_to_gpio(desc);
++}
++EXPORT_SYMBOL_GPL(of_get_named_gpio_flags);
++
+ /* Converts gpio_lookup_flags into bitmask of GPIO_* values */
+ static unsigned long of_convert_gpio_flags(enum of_gpio_flags flags)
+ {
+--- /dev/null
++++ b/include/linux/of_gpio_legacy.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Legacy OF GPIO flag helpers. The int-returning of_get_named_gpio_flags()
++ * and of_get_gpio_flags() were removed from mainline's <linux/of_gpio.h>
++ * before 6.18; the rocknix-joypad drivers still use them. This header has its
++ * own include guard so it composes with the native <linux/of_gpio.h>, and the
++ * implementation is re-exported from gpiolib-of.c on top of the still-present
++ * internal of_get_named_gpiod_flags().
++ */
++#ifndef __LINUX_OF_GPIO_LEGACY_H
++#define __LINUX_OF_GPIO_LEGACY_H
++
++#include <linux/errno.h>
++#include <linux/of.h>
++
++struct device_node;
++
++enum of_gpio_flags {
++	OF_GPIO_ACTIVE_LOW = 0x1,
++	OF_GPIO_SINGLE_ENDED = 0x2,
++	OF_GPIO_OPEN_DRAIN = 0x4,
++	OF_GPIO_TRANSITORY = 0x8,
++	OF_GPIO_PULL_UP = 0x10,
++	OF_GPIO_PULL_DOWN = 0x20,
++	OF_GPIO_PULL_DISABLE = 0x40,
++};
++
++#ifdef CONFIG_OF_GPIO
++extern int of_get_named_gpio_flags(const struct device_node *np,
++		const char *list_name, int index, enum of_gpio_flags *flags);
++#else
++static inline int of_get_named_gpio_flags(const struct device_node *np,
++		const char *list_name, int index, enum of_gpio_flags *flags)
++{
++	if (flags)
++		*flags = 0;
++	return -ENOSYS;
++}
++#endif
++
++static inline int of_get_gpio_flags(const struct device_node *np, int index,
++		enum of_gpio_flags *flags)
++{
++	return of_get_named_gpio_flags(np, "gpios", index, flags);
++}
++
++#endif /* __LINUX_OF_GPIO_LEGACY_H */
