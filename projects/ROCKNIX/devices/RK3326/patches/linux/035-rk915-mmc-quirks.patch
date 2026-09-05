@@ -65,47 +65,35 @@ Verified to apply cleanly to pristine 7.1.2; quirk bits 21-23 are unused there.
  		func->enable_timeout = jiffies_to_msecs(HZ);
 --- a/drivers/mmc/host/dw_mmc.c
 +++ b/drivers/mmc/host/dw_mmc.c
-@@ -253,6 +253,11 @@
- 	     ((cmd->arg >> 9) & 0x1FFFF) == SDIO_CCCR_ABORT))
- 		cmdr |= SDMMC_CMD_STOP;
- 	else if (cmd->opcode != MMC_SEND_STATUS && cmd->data)
-+		cmdr |= SDMMC_CMD_PRV_DAT_WAIT;
-+
-+	/* Some cards can't accept CMD52 while the DAT lines are busy */
-+	if (cmd->opcode == SD_IO_RW_DIRECT && !(cmdr & SDMMC_CMD_STOP) &&
-+	    mmc->card && (mmc->card->quirks & MMC_QUIRK_SDIO_CMD52_WAIT_DATA))
- 		cmdr |= SDMMC_CMD_PRV_DAT_WAIT;
- 
- 	if (cmd->opcode == SD_SWITCH_VOLTAGE) {
-@@ -1112,6 +1117,13 @@
+@@ -1205,6 +1205,13 @@
  	}
  }
  
-+static bool dw_mci_card_needs_cont_clock(struct dw_mci *host)
++static bool dw_mci_card_needs_cont_clock(struct dw_mci_slot *slot)
 +{
-+	struct mmc_card *card = host->mmc->card;
++	struct mmc_card *card = slot->mmc->card;
 +
 +	return card && (card->quirks & MMC_QUIRK_SDIO_CONT_CLOCK);
 +}
 +
- static void dw_mci_setup_bus(struct dw_mci *host, bool force_clkinit)
+ static void dw_mci_setup_bus(struct dw_mci_slot *slot, bool force_clkinit)
  {
- 	unsigned int clock = host->clock;
-@@ -1174,7 +1186,8 @@
+ 	struct dw_mci *host = slot->host;
+@@ -1268,7 +1275,8 @@
  
  		/* enable clock; only low power if no SDIO */
- 		clk_en_a = SDMMC_CLKEN_ENABLE;
--		if (!test_bit(DW_MMC_CARD_NO_LOW_PWR, &host->flags))
-+		if (!test_bit(DW_MMC_CARD_NO_LOW_PWR, &host->flags) &&
-+		    !dw_mci_card_needs_cont_clock(host))
- 			clk_en_a |= SDMMC_CLKEN_LOW_PWR;
+ 		clk_en_a = SDMMC_CLKEN_ENABLE << slot->id;
+-		if (!test_bit(DW_MMC_CARD_NO_LOW_PWR, &slot->flags))
++		if (!test_bit(DW_MMC_CARD_NO_LOW_PWR, &slot->flags) &&
++		    !dw_mci_card_needs_cont_clock(slot))
+ 			clk_en_a |= SDMMC_CLKEN_LOW_PWR << slot->id;
  		mci_writel(host, CLKENA, clk_en_a);
  
-@@ -1529,6 +1542,8 @@
+@@ -1671,6 +1679,8 @@
  		clk_en_a = clk_en_a_old & ~clken_low_pwr;
  	} else {
- 		clear_bit(DW_MMC_CARD_NO_LOW_PWR, &host->flags);
-+		if (dw_mci_card_needs_cont_clock(host))
+ 		clear_bit(DW_MMC_CARD_NO_LOW_PWR, &slot->flags);
++		if (dw_mci_card_needs_cont_clock(slot))
 +			return;
  		clk_en_a = clk_en_a_old | clken_low_pwr;
  	}

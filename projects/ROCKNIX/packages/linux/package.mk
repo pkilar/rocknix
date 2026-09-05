@@ -33,7 +33,7 @@ case ${DEVICE} in
     # Note that the patch dir 7.2 is automatically added as it matches the
     # version. When we move past 7.2, remember to add 7.2 to patch dirs.
     ;;
-  RK3326|AMD64)
+  AMD64)
     PKG_VERSION="7.1.2"
     PKG_SHA256="37198c93727be247c9fb5309bb86cd5e496c61e5322cd8c4eca9476bb0b5883f"
     PKG_URL="https://www.kernel.org/pub/linux/kernel/v${PKG_VERSION/.*/}.x/${PKG_NAME}-${PKG_VERSION}.tar.xz"
@@ -45,7 +45,7 @@ case ${DEVICE} in
     PKG_URL="https://www.kernel.org/pub/linux/kernel/v${PKG_VERSION/.*/}.x/${PKG_NAME}-${PKG_VERSION}.tar.xz"
     PKG_PATCH_DIRS+=" 7.0"
     ;;
-  S922X|RK3399)
+  S922X|RK3399|RK3326)
     PKG_VERSION="6.18.45"
     PKG_SHA256="30fa4a56579ca614ac125a12614f7f6466f87ab1278aef7b951dd74156deab33"
     PKG_URL="https://www.kernel.org/pub/linux/kernel/v${PKG_VERSION/.*/}.x/${PKG_NAME}-${PKG_VERSION}.tar.xz"
