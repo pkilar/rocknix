@@ -231,7 +231,34 @@ Ruled out as fixes, each on hardware: LMAC sleep (fw stays M0_READY);
 `lpw_no_sleep`/wake-notify (chip not asleep); mac80211 PS off; a runtime
 `LPW_CTRL` clock-gating write (the firmware register-write path does not reach
 that block — readback unchanged); a busy-write retry (wedge persists); a
-length-read retry (the 0xF0F0 was reload cycles, not CMD52 corruption).
+length-read retry (see below — `0xF0F0` is the same -EBUSY wedge seen through
+a byte read, so retrying it fails for the same reason).
+
+### The `0xF0F0` / "length too long" symptom is not diagnostic
+
+`rk915: rk915_serias_read: length(61680) too long error.` looks like the chip
+returning a garbage frame length. It is not. 61680 is `0xF0F0`, and it is the
+`-EBUSY` bus wedge seen through the length read:
+
+* `_sdio_readb()` returns the error code when the card reads back `0xFF` on a
+  busy bus (`sdio.c`);
+* `rk915_read_data_len()` stores that into two `unsigned char` bytes, and
+  `(u8)(-16)` is `0xF0`, so the two bytes combine to `(0xF0 << 8) | 0xF0` =
+  `0xF0F0` = 61680.
+
+So a write failing `-16` and a read failing `length(61680)` are the **same
+event** — every SDIO transaction to the card returning `-EBUSY` — reached from
+the write side or the read side. Whichever path touches the wedged bus first
+raises recovery.
+
+Consequence: **the byte pattern alone does not tell you the cause.** The idle
+`0xF0F0` a few seconds after association (fixed by keeping the LMAC awake,
+`rk915-0001`) and the under-load `0xF0F0` documented here have the same
+signature but different roots — one was the chip sleeping, the other is the
+bus wedging with the chip awake (`fw state` = M0_READY throughout). Diagnose it
+by reading `fw state` (SDIO reg 64) and a second register at the moment of
+failure: if both also return `-16`, it is the bus wedge, not a bad length and
+not the LMAC.
 
 ## Where a fix should start
 
