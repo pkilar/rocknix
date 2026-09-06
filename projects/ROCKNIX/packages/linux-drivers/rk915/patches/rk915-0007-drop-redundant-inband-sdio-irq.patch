@@ -1,0 +1,65 @@
+rk915: drop the redundant in-band SDIO irq claim, match the stock driver
+
+rk915_sdio_power_cycle() claimed the in-band SDIO irq purely as a
+side effect: sdio_claim_irq() makes the MMC core hold the CIU clock up,
+and the chip stalls if the bus clock gates while idle. But the kernel
+already holds the clock through MMC_QUIRK_SDIO_CONT_CLOCK
+(035-rk915-mmc-quirks.patch), which the dw_mmc slot picks up from the
+"rockchip,rk915" compatible - independent of any irq claim. So the
+in-band claim keeps the clock up a second, redundant way, and in doing
+so pulls in cap-sdio-irq and the dw_mmc TXDR/RXDR FIFO servicing that
+036-dw_mmc-dont-spin-on-a-dead-bus.patch then has to contain.
+
+The chip never signals rx in-band; rx is driven entirely by the
+out-of-band host-wake GPIO (rk915_register_irq -> devm_request_threaded_irq
+-> hal_irq_handler). Reverse-engineering the stock EmuELEC rk915.ko
+(kernel 5.10.160, byte-identical firmware) confirms this is how the
+vendor ships it: rockchip_wifi_get_oob_irq + devm_request_threaded_irq on
+the host-wake line, no sdio_claim_irq at all, with the vendor dw_mmc
+quirks (supports-rk912/ignore-pm-notify) holding the clock instead.
+
+Drop the claim (and its now-unused handler). The clock stays up via the
+kernel quirk; host->clk_claimed simply stays false, so the paired
+release in rk915_sdio_clock_release() becomes a no-op. Pairs with removing
+cap-sdio-irq from the SDIO DT node.
+--- a/src/sdio.c
++++ b/src/sdio.c
+@@ -393,14 +393,6 @@
+ #endif
+ };
+ 
+-static void rk915_sdio_irq_handler(struct sdio_func *func)
+-{
+-	struct hal_priv *priv = sdio_get_drvdata(func);
+-
+-	if (priv)
+-		hal_irq_handler(priv);
+-}
+-
+ static int rk915_attach(struct sdio_func *func)
+ {
+ 	struct hal_priv *priv;
+@@ -531,13 +523,17 @@
+ 	ret = mmc_hw_reset(func->card);
+ 	/* the CIS re-parse reset the bogus 0 ms enable timeout */
+ 	func->enable_timeout = 1000;
+-	/* chip stalls if the bus clock gates on idle; claiming the sdio
+-	 * irq holds the clock up while fw is up, dropped at teardown.
+-	 * chip never signals in-band, host-wake GPIO drives rx.
++	/*
++	 * The SDIO clock is kept running by the kernel's
++	 * MMC_QUIRK_SDIO_CONT_CLOCK quirk (035-rk915-mmc-quirks, matched on
++	 * the "rockchip,rk915" compatible), so there is no need to claim the
++	 * in-band SDIO irq to hold it up. The chip only ever signals rx on the
++	 * out-of-band host-wake GPIO; claiming the in-band irq additionally
++	 * pulled in cap-sdio-irq and its TXDR/RXDR FIFO servicing for nothing.
++	 * This matches the stock vendor driver, which drives rx from the
++	 * host-wake line exclusively (rockchip_wifi_get_oob_irq) and never
++	 * claims the in-band irq.
+ 	 */
+-	if (!ret && !host->clk_claimed &&
+-	    !sdio_claim_irq(func, rk915_sdio_irq_handler))
+-		host->clk_claimed = true;
+ 	if (!ret)
+ 		ret = sdio_enable_func(func);
+ 	if (!ret)
