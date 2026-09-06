@@ -18,9 +18,13 @@ instead of a hard hang.
 | vif accounting | 2nd restart hit `Exceeded Maximum` | 10 restarts, no exhaustion |
 | MAC / DHCP lease | new random MAC every module load | stable, from vendor storage |
 
-**Not fixed:** sustained transfer above roughly 15–29 KB/s kills the link within
-seconds, in either direction. Everything below documents what that is, what it is
-not, and how to reproduce it.
+**Not fixable in software (confirmed):** sustained transfer above roughly
+15–29 KB/s kills the link within seconds, in either direction. This is a hardware
+lockup in the SV6160's SDIO controller, not a driver or firmware bug — proven by
+tracing both firmware overload paths (all graceful) and by the fact that even
+hardware-served CMD52 register reads return -EBUSY during the wedge. See
+"the throughput fault is hardware — case closed" below. Everything between here
+and there documents what the fault is, what it is not, and how to reproduce it.
 
 **Workaround:** rate-limit. `rsync --bwlimit=15` moved a 24 MB kernel image onto
 the device over this link, first attempt, zero faults.
@@ -336,6 +340,55 @@ register but not the credit handshake). Directions, in order of promise:
 3. **`rx_bundle` / aggregation depth.** The SV6160 driver exposes an RX bundle
    size (default 16); a smaller bundle trades throughput for headroom. Untested
    here.
+
+## Update (Sep 2026): the throughput fault is hardware — case closed
+
+The three directions above (RX flow-control, faster drain, smaller bundle) were
+chased to the end and are dead. Two independent lines of evidence now place the
+wedge below the software entirely, in the SV6160's SDIO-slave controller silicon.
+
+**The stock vendor driver has no fix we were missing.** Reverse-engineered the
+stock EmuELEC `rk915.ko` (kernel 5.10.160) out of the device's own eMMC image.
+Its firmware blobs (`rk915_fw.bin`, `rk915_patch.bin`) are byte-identical to
+ours, it has no RX flow-control / buffer-credit code either, and it drives rx
+from the out-of-band host-wake GPIO exclusively (`rockchip_wifi_get_oob_irq` +
+`devm_request_threaded_irq`, **no `sdio_claim_irq`**), keeping the bus clock alive
+through vendor `dw_mmc` quirks (`supports-rk912` / `ignore-pm-notify`). We match
+that model now — `rk915-0007-drop-redundant-inband-sdio-irq.patch` drops the
+redundant in-band SDIO irq claim; kernel patch 035's `MMC_QUIRK_SDIO_CONT_CLOCK`
+(keyed on the `rockchip,rk915` compatible) holds the clock instead. Hardware
+tested: the interface associates and passes traffic on the host-wake path alone,
+and the wedge is **unchanged** by it — proving the fault is independent of the
+host interrupt model.
+
+**The firmware handles overload gracefully — there is no spin to patch out.**
+Disassembled `rk915_fw.bin` (RISC-V RV32IMC, capstone) and traced the full TX and
+RX overload paths:
+
+* **RX:** `event_enqueue` (0x020021cc) returns `-ENOSPC` on a full queue — frees
+  the buffer, no spin; both callers (the RX processing loop and the RX event
+  dispatcher) drop the frame and continue.
+* **TX:** the SDIO host-write ISR (0x02002db4, reads `IRQ_STATUS`/`RX_STATUS`)
+  dispatches to ring-buffer helpers that return on full, and all five `buf_alloc`
+  call sites return an error on allocation failure. No retry, no spin.
+
+**The discriminator that settles it.** During the wedge, even plain CMD52 register
+reads (`fw_state` reg 64, `RECV_LEN`) return `-EBUSY`. Those are answered by the
+SDIO slave controller **hardware**, without the firmware running — a stuck or
+spinning firmware cannot stop them. Register reads failing therefore proves the
+SDIO controller silicon itself has locked up. Only an out-of-band power cycle
+(which resets the chip) clears it — exactly what the driver's recovery does.
+
+**Conclusion: not fixable in software.** The wedge is a hardware lockup in the
+SV6160's SDIO controller under sustained transfer, in either direction. It is not
+a driver bug (we now match the vendor's own model) and not a firmware bug (every
+overload path drops cleanly; the failure is below the firmware). A wedge-free,
+high-throughput driver is not achievable on this chip. The two usable operating
+points are the self-healing wedge-and-recover (~45 KB/s, with churn) and a
+rate-limit below the threshold (`rsync --bwlimit=15`, ~15–29 KB/s, stable);
+neither can be improved in software. Full RE trace and per-function addresses in
+`rk915-wifi-investigation.md`.
+
 ## Method note
 
 Four hypotheses about the interrupt storm were wrong before the register dump
