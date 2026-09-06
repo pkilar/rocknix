@@ -64,9 +64,9 @@ wifi chip stops responding under load.
 +	int_mask = mci_readl(host, INTMASK);
 +	if (int_mask & bit) {
 +		mci_writel(host, INTMASK, int_mask & ~bit);
-+		dev_err_ratelimited(host->dev,
-+				    "FIFO irq %#x with no transfer to service; masking\n",
-+				    bit);
++		dev_warn_once(host->dev,
++			      "FIFO irq %#x with no transfer to service; masking; further occurrences are handled silently\n",
++			      bit);
 +	}
 +	spin_unlock_irqrestore(&host->irq_lock, irqflags);
 +}
