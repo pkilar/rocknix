@@ -13,6 +13,19 @@ Taken from sunshineinabox's rk915 7.1 bring-up:
 https://github.com/stolen/rk915/pull/2 -> docs/mainline-linux-7.1-rk915-quirks.patch
 Verified to apply cleanly to pristine 7.1.2; quirk bits 21-23 are unused there.
 
+The MMC_QUIRK_SDIO_CMD52_WAIT_DATA half is what actually fixes the sustained-
+transfer throughput wedge. The chip cannot accept a CMD52 (a register poll -
+RECV_LEN, fw_state) while a CMD53 data transfer is on the DAT lines; if one is
+issued mid-transfer it corrupts the bus and every following transaction returns
+-EBUSY until a power cycle. dw_mci_prepare_command() therefore sets
+SDMMC_CMD_PRV_DAT_WAIT on CMD52 for this card, so the controller holds the
+command until the previous data phase completes. Collisions are rare at low
+traffic and near-certain under load - why the link was stable below ~15-29 KB/s
+and wedged above it. The stock vendor driver does the same via its
+MMC_CAP2_WIFI_RK912 path and sustains 2.6 MB/s with no wedge. This hunk
+(dw_mci_prepare_command, @@ -267) was dropped in an earlier 6.18 rebase, leaving
+the quirk defined but never consumed - restoring it is the fix.
+
 --- a/include/linux/mmc/card.h
 +++ b/include/linux/mmc/card.h
 @@ -331,6 +331,9 @@
@@ -65,6 +78,18 @@ Verified to apply cleanly to pristine 7.1.2; quirk bits 21-23 are unused there.
  		func->enable_timeout = jiffies_to_msecs(HZ);
 --- a/drivers/mmc/host/dw_mmc.c
 +++ b/drivers/mmc/host/dw_mmc.c
+@@ -267,6 +267,11 @@
+ 	else if (cmd->opcode != MMC_SEND_STATUS && cmd->data)
+ 		cmdr |= SDMMC_CMD_PRV_DAT_WAIT;
+ 
++	/* Some cards (RK915 SDIO) can't accept CMD52 while the DAT lines are busy */
++	if (cmd->opcode == SD_IO_RW_DIRECT && !(cmdr & SDMMC_CMD_STOP) &&
++	    mmc->card && (mmc->card->quirks & MMC_QUIRK_SDIO_CMD52_WAIT_DATA))
++		cmdr |= SDMMC_CMD_PRV_DAT_WAIT;
++
+ 	if (cmd->opcode == SD_SWITCH_VOLTAGE) {
+ 		u32 clk_en_a;
+ 
 @@ -1205,6 +1205,13 @@
  	}
  }
