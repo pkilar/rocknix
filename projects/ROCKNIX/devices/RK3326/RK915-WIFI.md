@@ -18,13 +18,20 @@ instead of a hard hang.
 | vif accounting | 2nd restart hit `Exceeded Maximum` | 10 restarts, no exhaustion |
 | MAC / DHCP lease | new random MAC every module load | stable, from vendor storage |
 
-**Not fixable in software (confirmed):** sustained transfer above roughly
-15–29 KB/s kills the link within seconds, in either direction. This is a hardware
-lockup in the SV6160's SDIO controller, not a driver or firmware bug — proven by
-tracing both firmware overload paths (all graceful) and by the fact that even
-hardware-served CMD52 register reads return -EBUSY during the wedge. See
-"the throughput fault is hardware — case closed" below. Everything between here
-and there documents what the fault is, what it is not, and how to reproduce it.
+**FIXED (root cause found):** sustained transfer above roughly 15–29 KB/s killed
+the link within seconds, in either direction. The cause was a **missing
+SDMMC_CMD_PRV_DAT_WAIT on CMD52**: the chip can't take a register poll (RECV_LEN /
+fw_state, a CMD52) while a CMD53 data phase is on the DAT lines, and without
+PRV_DAT_WAIT the controller issues one mid-transfer, corrupts the bus, and every
+following transaction returns -EBUSY until a power cycle — rare at low rate,
+near-certain under load. The `MMC_QUIRK_SDIO_CMD52_WAIT_DATA` quirk was defined
+and set but its `dw_mci_prepare_command()` hunk had been dropped in the 6.18
+rebase of patch 035, leaving it inert. Restored in commit 999fca486c. The stock
+EmuELEC driver does the identical thing via MMC_CAP2_WIFI_RK912 and sustains
+2.6 MB/s (user-verified on the same hardware), which is what disproved the earlier
+"hardware, not fixable" reading. See the correction at the end of this file. The
+sections below are the historical diagnosis; the -EBUSY was the host controller
+choking on a corrupted bus, not a chip-silicon lockup.
 
 **Workaround:** rate-limit. `rsync --bwlimit=15` moved a 24 MB kernel image onto
 the device over this link, first attempt, zero faults.
@@ -341,7 +348,16 @@ register but not the credit handshake). Directions, in order of promise:
    size (default 16); a smaller bundle trades throughput for headroom. Untested
    here.
 
-## Update (Sep 2026): the throughput fault is hardware — case closed
+## Update (Sep 2026): the throughput fault attributed to hardware — SUPERSEDED, WRONG
+
+> **This conclusion was wrong.** It was falsified by a direct test: the stock
+> EmuELEC firmware moved a 22 MB file over the same chip at 2.6 MB/s with no
+> wedge. The real cause is a host-side driver bug (a dropped CMD52 PRV_DAT_WAIT
+> hunk), fixed in commit 999fca486c — see "FIXED — the real root cause" at the
+> end. The reasoning below is kept as a record of how the misdiagnosis happened:
+> the flaw was assuming a -EBUSY CMD52 read proves the *chip's* controller wedged,
+> when the *host* dw_mmc controller returns -EBUSY on a bus it corrupted itself,
+> and a chip power-cycle re-enumerates the link and clears a host-side wedge too.
 
 The three directions above (RX flow-control, faster drain, smaller bundle) were
 chased to the end and are dead. Two independent lines of evidence now place the
@@ -388,6 +404,32 @@ points are the self-healing wedge-and-recover (~45 KB/s, with churn) and a
 rate-limit below the threshold (`rsync --bwlimit=15`, ~15–29 KB/s, stable);
 neither can be improved in software. Full RE trace and per-function addresses in
 `rk915-wifi-investigation.md`.
+
+## Update (Sep 2026): FIXED — the real root cause (a dropped CMD52 PRV_DAT_WAIT hunk)
+
+A user booted the stock EmuELEC firmware on the same handheld and copied a 22 MB
+file over Wi-Fi at **2.6 MB/s with no wedge**. That single test falsifies the
+"hardware, not fixable" conclusion above and proves the fault is software.
+
+Root cause: `dw_mci_prepare_command()` was not setting `SDMMC_CMD_PRV_DAT_WAIT` on
+CMD52 for this card. The rk915 cannot accept a CMD52 (a register poll — RECV_LEN,
+fw_state) while a CMD53 data phase is on the DAT lines. Without PRV_DAT_WAIT the
+controller issues the poll mid-transfer, corrupts the bus, and every following
+transaction — read or write, CMD52 or CMD53 — returns -EBUSY until a power cycle.
+Collision probability scales with in-flight CMD53 traffic, so the link was stable
+below ~15–29 KB/s and wedged above it.
+
+The quirk `MMC_QUIRK_SDIO_CMD52_WAIT_DATA` was defined and set on the card, but
+the hunk that consumes it (in `dw_mci_prepare_command`) had been dropped when
+patch 035 was rebased for 6.18 — the flag was inert. The original 7.1 patch had
+it; the stock vendor driver does the same via `MMC_CAP2_WIFI_RK912`. Restored in
+patch 035 (`@@ -267`), commit 999fca486c. Hardware throughput re-test pending.
+
+Lesson: the "hardware discriminator" (CMD52 register reads also failing) was not a
+discriminator at all. A -EBUSY there is the *host* controller reporting a bus it
+corrupted, not proof the *chip* locked up; and a chip power-cycle clears a
+host-side wedge by re-enumeration. Always measure against the known-good reference
+(here, the stock firmware) before declaring a fault unfixable.
 
 ## Method note
 
